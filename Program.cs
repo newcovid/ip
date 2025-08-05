@@ -702,7 +702,7 @@ namespace IPSwitcher
         }
 
         /// <summary>
-        /// 启动路由跟踪。
+        /// 启动路由跟踪，并允许用户随时中断。
         /// </summary>
         static async Task<bool> StartTraceroute()
         {
@@ -725,10 +725,11 @@ namespace IPSwitcher
             catch (Exception ex)
             {
                 AnsiConsole.MarkupLine($"[red]无法解析目标: {Markup.Escape(ex.Message)}[/]");
-                return true; // Operation considered "complete" as it produced a result (an error message)
+                return true;
             }
 
             AnsiConsole.MarkupLine($"\n通过最多 30 个跃点跟踪到 [yellow]{Markup.Escape(target)}[/] [[[yellow]{targetIp}[/]]] 的路由:");
+            AnsiConsole.MarkupLine("[grey](按 Esc 键可随时中断)[/]");
 
             var table = new Table().Border(TableBorder.Simple);
             table.AddColumn("跃点");
@@ -736,62 +737,137 @@ namespace IPSwitcher
             table.AddColumn("IP 地址");
             table.AddColumn("主机名");
 
-            await AnsiConsole.Live(table)
-                .StartAsync(async ctx =>
+            // --- 修改开始: 引入CancellationToken实现立即中断 ---
+
+            // 使用CancellationTokenSource来从键盘发出中断信号。
+            using var cts = new CancellationTokenSource();
+            var cancellationToken = cts.Token;
+            bool wasCancelled = false;
+
+            // 此任务在后台运行以侦听Esc键。
+            // 当按下Esc时，它会取消CancellationTokenSource。
+            var keyListenerTask = Task.Run(() =>
+            {
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    const int maxHops = 30;
-                    const int timeout = 4000;
-
-                    for (int ttl = 1; ttl <= maxHops; ttl++)
+                    if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape)
                     {
-                        using var ping = new Ping();
-                        var pingOptions = new PingOptions(ttl, true);
-                        var stopwatch = new Stopwatch();
-
-                        try
-                        {
-                            stopwatch.Start();
-                            var reply = await ping.SendPingAsync(targetIp, timeout, new byte[32], pingOptions);
-                            stopwatch.Stop();
-
-                            if (reply.Status == IPStatus.Success || reply.Status == IPStatus.TtlExpired)
-                            {
-                                string hostname;
-                                try
-                                {
-                                    var hostEntry = await Dns.GetHostEntryAsync(reply.Address);
-                                    hostname = Markup.Escape(hostEntry.HostName);
-                                }
-                                catch
-                                {
-                                    hostname = "[grey]N/A[/]";
-                                }
-
-                                table.AddRow(ttl.ToString(), $"[yellow]{stopwatch.ElapsedMilliseconds}ms[/]", $"[green]{reply.Address}[/]", hostname);
-                                ctx.Refresh();
-
-                                if (reply.Status == IPStatus.Success)
-                                {
-                                    table.Caption = new TableTitle("[bold green]跟踪完成[/]");
-                                    ctx.Refresh();
-                                    return;
-                                }
-                            }
-                            else
-                            {
-                                table.AddRow(ttl.ToString(), "*", "[grey]请求超时[/]", "");
-                                ctx.Refresh();
-                            }
-                        }
-                        catch (PingException)
-                        {
-                            table.AddRow(ttl.ToString(), "*", "[red]错误[/]", "");
-                            ctx.Refresh();
-                        }
+                        // 向主循环发送取消信号。
+                        cts.Cancel();
                     }
-                    table.Caption = new TableTitle("[bold yellow]跟踪已达到最大跃点数[/]");
-                    ctx.Refresh();
-                });
+                    // 短暂等待以防止此循环消耗100%的CPU。
+                    Task.Delay(50, cancellationToken).ContinueWith(_ => { });
+                }
+            }, cancellationToken);
+
+            try
+            {
+                await AnsiConsole.Live(table)
+                    .StartAsync(async ctx =>
+                    {
+                        const int maxHops = 30;
+                        const int timeout = 4000; // 每次ping尝试的超时时间。
+
+                        for (int ttl = 1; ttl <= maxHops && !cancellationToken.IsCancellationRequested; ttl++)
+                        {
+                            using var ping = new Ping();
+                            var pingOptions = new PingOptions(ttl, true);
+                            var stopwatch = new Stopwatch();
+
+                            try
+                            {
+                                var pingTask = ping.SendPingAsync(targetIp, timeout, new byte[32], pingOptions);
+                                stopwatch.Start();
+
+                                // 创建一个仅在请求取消时才会完成的任务。
+                                var cancellationDelayTask = Task.Delay(Timeout.Infinite, cancellationToken);
+
+                                // 等待ping完成或触发取消。
+                                var completedTask = await Task.WhenAny(pingTask, cancellationDelayTask);
+                                stopwatch.Stop();
+
+                                // 如果完成的任务是我们的取消任务，则中断循环。
+                                if (completedTask == cancellationDelayTask)
+                                {
+                                    wasCancelled = true;
+                                    break;
+                                }
+
+                                // 否则，ping任务已完成。等待它以获取结果。
+                                var reply = await pingTask;
+
+                                if (reply.Status == IPStatus.Success || reply.Status == IPStatus.TtlExpired)
+                                {
+                                    string hostname = "[grey]N/A[/]";
+                                    try
+                                    {
+                                        // 同时使DNS查找也可被取消。
+                                        var resolveHostTask = Dns.GetHostEntryAsync(reply.Address);
+                                        var dnsCancellationTask = Task.Delay(1500, cancellationToken); // DNS的1.5秒超时
+                                        var completedDnsTask = await Task.WhenAny(resolveHostTask, dnsCancellationTask);
+
+                                        if (completedDnsTask == resolveHostTask && !resolveHostTask.IsFaulted)
+                                        {
+                                            hostname = Markup.Escape(resolveHostTask.Result.HostName);
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        // 忽略DNS解析错误。
+                                    }
+
+                                    table.AddRow(ttl.ToString(), $"[yellow]{stopwatch.ElapsedMilliseconds}ms[/]", $"[green]{reply.Address}[/]", hostname);
+                                    ctx.Refresh();
+
+                                    if (reply.Status == IPStatus.Success)
+                                    {
+                                        table.Caption = new TableTitle("[bold green]跟踪完成[/]");
+                                        ctx.Refresh();
+                                        return; // 跟踪成功完成。
+                                    }
+                                }
+                                else
+                                {
+                                    table.AddRow(ttl.ToString(), "*", "[grey]请求超时[/]", "");
+                                    ctx.Refresh();
+                                }
+                            }
+                            catch (PingException)
+                            {
+                                table.AddRow(ttl.ToString(), "*", "[red]错误[/]", "");
+                                ctx.Refresh();
+                            }
+                        }
+
+                        // 根据循环结束的方式设置最终的表格标题。
+                        if (wasCancelled)
+                        {
+                            table.Caption = new TableTitle("[bold yellow]跟踪已被用户中断[/]");
+                        }
+                        else
+                        {
+                            table.Caption = new TableTitle("[bold yellow]跟踪已达到最大跃点数[/]");
+                        }
+                        ctx.Refresh();
+                    });
+            }
+            finally
+            {
+                // 确保后台的按键监听器被停止和清理。
+                if (!cts.IsCancellationRequested)
+                {
+                    cts.Cancel();
+                }
+                await keyListenerTask;
+
+                // 清理任何残留的按键输入。
+                while (Console.KeyAvailable)
+                {
+                    Console.ReadKey(true);
+                }
+            }
+            // --- 修改结束 ---
+
             return true;
         }
 
