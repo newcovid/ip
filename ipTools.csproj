@@ -1,0 +1,28 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Subsystem>Console</Subsystem>
+
+    <!-- 
+      最终优化配置:
+      生成一个依赖框架的、最小体积的单个可执行文件。
+    -->
+    <!-- 1. 将应用发布为单个可执行文件 -->
+    <PublishSingleFile>true</PublishSingleFile>
+    
+    <!-- 2. (关键) 依赖目标机器上已安装的 .NET 8 运行时，这是减小体积的核心。-->
+    <SelfContained>false</SelfContained>
+
+    <!-- 
+      注意: 我们已经移除了 <PublishTrimmed> 和 <PublishReadyToRun>。
+      - PublishTrimmed 在依赖框架模式下不受支持并导致错误。
+      - PublishReadyToRun 会轻微增加文件大小，移除它可以获得最小的体积。
+    -->
+
+  </PropertyGroup>
+
+</Project>
