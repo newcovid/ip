@@ -1,19 +1,61 @@
-﻿using System;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace IPSwitcher
 {
+    /// <summary>
+    /// 用于存储局域网扫描结果的辅助类。
+    /// </summary>
+    public class ScanResult
+    {
+        public string IpAddress { get; set; } = "";
+        public string MacAddress { get; set; } = "";
+        public string Hostname { get; set; } = "";
+    }
+
+    /// <summary>
+    /// 用于存储从 API 获取的公网 IP 信息 (ipinfo.io)。
+    /// </summary>
+    public class PublicIpInfo
+    {
+        [JsonPropertyName("ip")]
+        public string? Ip { get; set; }
+
+        [JsonPropertyName("city")]
+        public string? City { get; set; }
+
+        [JsonPropertyName("region")]
+        public string? Region { get; set; }
+
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
+
+        [JsonPropertyName("org")]
+        public string? Org { get; set; } // ISP
+    }
+
+
     class Program
     {
+        private static PublicIpInfo? _publicIpInfo;
+        private static string _publicIpStatus = "正在获取...";
+
         static async Task Main(string[] args)
         {
             // 注册代码页提供程序以支持GBK等编码
@@ -23,15 +65,49 @@ namespace IPSwitcher
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
 
+            // 异步获取公网IP信息，不阻塞UI
+            _ = GetPublicIpInfoAsync();
+
             while (true)
             {
+                // 清除任何残留的按键输入
+                while (Console.KeyAvailable)
+                {
+                    Console.ReadKey(true);
+                }
+
                 if (!await MainMenu())
                 {
                     break; // 如果MainMenu返回false则退出程序
                 }
             }
 
-            Console.WriteLine("程序已退出。");
+            AnsiConsole.MarkupLine("[green]程序已退出。[/]");
+        }
+
+        /// <summary>
+        /// 异步获取公网IP信息。
+        /// </summary>
+        static async Task GetPublicIpInfoAsync()
+        {
+            try
+            {
+                using var client = new HttpClient();
+                client.Timeout = TimeSpan.FromSeconds(5);
+                // 使用更稳定的 ipinfo.io API
+                var response = await client.GetStringAsync("https://ipinfo.io/json");
+                _publicIpInfo = JsonSerializer.Deserialize<PublicIpInfo>(response);
+                if (string.IsNullOrWhiteSpace(_publicIpInfo?.Ip))
+                {
+                    _publicIpStatus = "[red]获取失败[/]";
+                    _publicIpInfo = null;
+                }
+            }
+            catch (Exception)
+            {
+                _publicIpStatus = "[red]获取失败 (网络错误)[/]";
+                _publicIpInfo = null;
+            }
         }
 
         /// <summary>
@@ -41,71 +117,73 @@ namespace IPSwitcher
         {
             var options = new List<string>
             {
-                "[1] 配置网络适配器 IP",
-                "[2] 扫描局域网设备",
-                "[3] 退出程序"
+                "配置网络适配器 IP",
+                "扫描局域网设备",
+                "网络诊断工具",
+                "退出程序"
             };
 
-            int actionChoice = GetInteractiveMenuChoice(DrawDashboard, options, 1);
+            AnsiConsole.Clear();
+            AnsiConsole.Write(new FigletText("ipTools").Centered().Color(Color.Blue));
 
-            switch (actionChoice)
+            var chosenIndex = await ShowMainMenuWithOptions(options);
+
+
+            // 根据用户的选择执行操作
+            switch (chosenIndex)
             {
-                case -1: // 用户在顶层菜单按下了 Esc
-                    return false;
-                case 1:
-                    ConfigureIpMenu();
+                case 0:
+                    await ConfigureIpMenu();
                     break;
-                case 2:
+                case 1:
                     await StartLanScan();
                     break;
+                case 2:
+                    await NetworkDiagnosticsMenu();
+                    break;
                 case 3:
+                case -1: // ESC in main menu means exit
                     return false; // 发出退出主循环的信号
             }
 
-            if (actionChoice != 2)
-            {
-                Console.WriteLine("操作完成。按任意键返回主菜单...");
-                Console.ReadKey(true);
-            }
             return true; // 继续主循环
         }
 
         /// <summary>
-        /// 绘制实时信息仪表盘的静态框架。
+        /// [已修复] 使用传入的适配器信息构建本地信息网格，避免重复的系统调用。
         /// </summary>
-        static void DrawDashboard()
+        private static Grid GetLocalInfoGrid(AdapterInfo? activeAdapter)
         {
-            Console.WriteLine("┌───────────────────────────────────────────────────────┐");
-            Console.WriteLine("│                                                       │"); // 时间行
-            Console.WriteLine("│                                                       │"); // IP 行
-            Console.WriteLine("└───────────────────────────────────────────────────────┘");
-            Console.WriteLine("\n 您希望执行什么操作?");
-            UpdateDashboard(); // 首次填充数据
+            var grid = new Grid();
+            grid.AddColumn(new GridColumn().Width(12).NoWrap()); // 固定宽度的标签列
+            grid.AddColumn(new GridColumn());
+            grid.AddRow("[bold]当前时间:[/]", $"[yellow]{DateTime.Now:yyyy-MM-dd HH:mm:ss}[/]");
+            grid.AddRow("[bold]活动连接:[/]", $"[yellow]{Markup.Escape(activeAdapter?.Name ?? "无活动连接")}[/]");
+            grid.AddRow("[bold]本地 IP:[/]", $"[yellow]{activeAdapter?.IpAddress ?? "N/A"}[/]");
+            return grid;
         }
 
         /// <summary>
-        /// 仅更新仪表盘中的动态数据，避免闪烁。
+        /// 为标签列设置固定宽度以确保对齐
         /// </summary>
-        static void UpdateDashboard()
+        static Grid GetPublicInfoGrid()
         {
-            var originalLeft = Console.CursorLeft;
-            var originalTop = Console.CursorTop;
-
-            var activeAdapter = AdapterInfo.GetActiveAdapter();
-            string time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-            string activeIp = activeAdapter?.IpAddress ?? "N/A";
-            string adapterName = activeAdapter?.Name ?? "无活动连接";
-
-            string timeLine = $"当前时间: {time}";
-            string ipLine = $"活动连接: {adapterName} ({activeIp})";
-
-            Console.SetCursorPosition(2, 1); // 定位到第一行数据区
-            Console.Write(PadRightForMixedChars(timeLine, 53));
-
-            Console.SetCursorPosition(2, 2); // 定位到第二行数据区
-            Console.Write(PadRightForMixedChars(ipLine, 53));
-
-            Console.SetCursorPosition(originalLeft, originalTop); // 恢复光标位置
+            var grid = new Grid();
+            grid.AddColumn(new GridColumn().Width(12).NoWrap()); // 固定宽度的标签列
+            grid.AddColumn(new GridColumn());
+            if (_publicIpInfo != null)
+            {
+                grid.AddRow("[bold]公网 IP:[/]", $"[aqua]{_publicIpInfo.Ip ?? "N/A"}[/]");
+                grid.AddRow("[bold]地理位置:[/]", $"[aqua]{Markup.Escape($"{_publicIpInfo.Country ?? ""}, {_publicIpInfo.Region ?? ""}, {_publicIpInfo.City ?? ""}")}[/]");
+                grid.AddRow("[bold]运营商:[/]", $"[aqua]{Markup.Escape(_publicIpInfo.Org ?? "N/A")}[/]");
+            }
+            else
+            {
+                grid.AddRow("[bold]公网 IP:[/]", _publicIpStatus);
+                grid.AddRow("[bold]地理位置:[/]", _publicIpStatus);
+                grid.AddRow("[bold]运营商:[/]", _publicIpStatus);
+            }
+            return grid;
         }
 
         /// <summary>
@@ -113,73 +191,92 @@ namespace IPSwitcher
         /// </summary>
         static async Task StartLanScan()
         {
+            AnsiConsole.Clear();
             var activeAdapter = AdapterInfo.GetActiveAdapter();
             string? adapterToScan;
 
             if (activeAdapter != null)
             {
-                // 如果找到活动适配器，直接使用
                 adapterToScan = activeAdapter.Name;
             }
             else
             {
-                // 否则，让用户选择
-                adapterToScan = SelectAdapter("未找到活动网络，请选择要扫描的适配器");
+                adapterToScan = await SelectAdapter("未找到活动网络，请选择要扫描的适配器");
             }
 
             if (!string.IsNullOrEmpty(adapterToScan))
             {
                 await ScanLanDevices(adapterToScan);
-                Console.WriteLine("\n扫描完成。按任意键返回主菜单...");
-                Console.ReadKey(true);
+                AnsiConsole.Prompt(new TextPrompt<string>("[grey]扫描完成。按任意键返回主菜单...[/]").AllowEmpty());
             }
         }
 
         /// <summary>
         /// 用于IP配置的二级菜单。
         /// </summary>
-        static void ConfigureIpMenu()
+        static async Task ConfigureIpMenu()
         {
-            string? selectedAdapter = SelectAdapter("请选择要配置的网络适配器");
-            if (string.IsNullOrEmpty(selectedAdapter)) return;
-
-            var prompt = $" 已选定适配器: \"{selectedAdapter}\"\n" +
-                         "---------------------------------------------------------\n\n" +
-                         "请选择要执行的操作:";
-            var options = new List<string>
+            while (true)
             {
-                "[1] 设置静态 IP 地址",
-                "[2] 设置为自动获取 (DHCP)"
-            };
+                AnsiConsole.Clear();
+                string? selectedAdapterName = await SelectAdapter("请选择要配置的网络适配器");
+                if (string.IsNullOrEmpty(selectedAdapterName))
+                {
+                    return; // 用户按 ESC 或选择返回
+                }
 
-            int choice = GetInteractiveMenuChoice(() => Console.WriteLine(prompt), options, 1);
+                while (true)
+                {
+                    AnsiConsole.Clear();
+                    var panel = new Panel($"[bold]已选定适配器:[/] [yellow]\"{Markup.Escape(selectedAdapterName)}\"[/]")
+                        .Border(BoxBorder.Rounded);
+                    AnsiConsole.Write(panel);
 
-            if (choice == -1) return; // 用户按下了 Esc
+                    var options = new List<string>
+                    {
+                        "设置静态 IP 地址",
+                        "设置为自动获取 (DHCP)",
+                        "返回上一级 (选择其他适配器)"
+                    };
 
-            if (choice == 1)
-            {
-                SetStaticIP(selectedAdapter);
-            }
-            else
-            {
-                SetDhcpIP(selectedAdapter);
+                    var choiceIndex = await ShowMenuAsync(options, "[bold]请选择要执行的操作:[/]");
+
+
+                    if (choiceIndex == -1 || choiceIndex == 2) break; // -1 is ESC, 2 is "返回"
+
+                    bool operationCancelled = false;
+                    switch (choiceIndex)
+                    {
+                        case 0:
+                            operationCancelled = !SetStaticIP(selectedAdapterName);
+                            break;
+                        case 1:
+                            SetDhcpIP(selectedAdapterName);
+                            break;
+                    }
+
+                    if (!operationCancelled && choiceIndex < 2)
+                    {
+                        AnsiConsole.Prompt(new TextPrompt<string>("[grey]操作完成。按任意键返回...[/]").AllowEmpty());
+                    }
+                }
             }
         }
 
         /// <summary>
-        /// 扫描本地网络上的设备。
+        /// 扫描本地网络上的设备，并解析主机名，同时确保本机信息准确无误。
         /// </summary>
         static async Task ScanLanDevices(string adapterName)
         {
-            Console.Clear();
-            Console.WriteLine("================ 局域网设备扫描 ==================");
+            AnsiConsole.Clear();
+            AnsiConsole.MarkupLine($"[bold blue]================ 局域网设备扫描 ==================[/]");
 
             var adapter = NetworkInterface.GetAllNetworkInterfaces()
                 .FirstOrDefault(n => n.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase));
 
             if (adapter == null)
             {
-                Console.WriteLine($"错误: 找不到名为 \"{adapterName}\" 的适配器。");
+                AnsiConsole.MarkupLine($"[red]错误: 找不到名为 \"{Markup.Escape(adapterName)}\" 的适配器。[/]");
                 return;
             }
 
@@ -188,7 +285,7 @@ namespace IPSwitcher
 
             if (ipInfo == null)
             {
-                Console.WriteLine($"错误: 适配器 \"{adapterName}\" 未配置IPv4地址。");
+                AnsiConsole.MarkupLine($"[red]错误: 适配器 \"{Markup.Escape(adapterName)}\" 未配置IPv4地址。[/]");
                 return;
             }
 
@@ -199,140 +296,191 @@ namespace IPSwitcher
             var ipRange = GetIpRange(networkAddress, subnetMask).ToList();
             if (!ipRange.Any())
             {
-                Console.WriteLine("错误: 无法确定有效的IP扫描范围。");
+                AnsiConsole.MarkupLine("[red]错误: 无法确定有效的IP扫描范围。[/]");
                 return;
             }
 
-            Console.WriteLine($"本机IP: {ipAddress}, 正在扫描网段: {networkAddress} / {subnetMask}");
-            Console.WriteLine($"扫描范围: {ipRange.First()} - {ipRange.Last()}");
-            Console.WriteLine("正在并行扫描，请稍候...");
+            AnsiConsole.MarkupLine($"[bold]本机IP:[/] [yellow]{ipAddress}[/], [bold]正在扫描网段:[/] [yellow]{networkAddress} / {subnetMask}[/]");
+            AnsiConsole.MarkupLine($"[bold]扫描范围:[/] [yellow]{ipRange.First()} - {ipRange.Last()}[/]");
 
-            var onlineHosts = new List<IPAddress>();
-            var pingTasks = new List<Task>();
-            var semaphore = new SemaphoreSlim(100);
+            var onlineHosts = new ConcurrentBag<IPAddress>();
+            var results = new ConcurrentBag<ScanResult>();
 
-            foreach (var ip in ipRange)
-            {
-                await semaphore.WaitAsync();
-                pingTasks.Add(Task.Run(async () =>
+            await AnsiConsole.Progress()
+                .Columns(new ProgressColumn[]
                 {
-                    try
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                    new SpinnerColumn(),
+                })
+                .StartAsync(async ctx =>
+                {
+                    var pingProgressTask = ctx.AddTask("[green]Ping 扫描[/]", new ProgressTaskSettings { MaxValue = ipRange.Count });
+                    var pingSemaphore = new SemaphoreSlim(100);
+                    var pingTasks = ipRange.Select(async ip =>
                     {
-                        using (var ping = new Ping())
+                        await pingSemaphore.WaitAsync();
+                        try
                         {
-                            var reply = await ping.SendPingAsync(ip, 1000);
-                            if (reply.Status == IPStatus.Success)
+                            using (var ping = new Ping())
                             {
-                                lock (onlineHosts)
+                                var reply = await ping.SendPingAsync(ip, 1000);
+                                if (reply.Status == IPStatus.Success)
                                 {
                                     onlineHosts.Add(ip);
                                 }
                             }
                         }
-                    }
-                    finally
+                        finally
+                        {
+                            pingProgressTask.Increment(1);
+                            pingSemaphore.Release();
+                        }
+                    });
+                    await Task.WhenAll(pingTasks);
+
+                    var resolveProgressTask = ctx.AddTask("[aqua]解析主机[/]", new ProgressTaskSettings { MaxValue = onlineHosts.Count });
+                    var arpCache = GetArpCache();
+                    var resolveSemaphore = new SemaphoreSlim(50);
+                    var resolveTasks = onlineHosts.Select(async host =>
                     {
-                        semaphore.Release();
-                    }
-                }));
-            }
+                        await resolveSemaphore.WaitAsync();
+                        try
+                        {
+                            string ipStr = host.ToString();
+                            string macAddress = arpCache.TryGetValue(ipStr, out var mac) ? mac : "(无法获取)";
+                            string hostname = "(无法解析)";
+                            try
+                            {
+                                var resolveHostTask = Dns.GetHostEntryAsync(host);
+                                if (await Task.WhenAny(resolveHostTask, Task.Delay(1500)) == resolveHostTask && !resolveHostTask.IsFaulted)
+                                {
+                                    hostname = resolveHostTask.Result.HostName;
+                                }
+                            }
+                            catch (SocketException) { }
 
-            await Task.WhenAll(pingTasks);
+                            results.Add(new ScanResult { IpAddress = ipStr, MacAddress = macAddress, Hostname = hostname });
+                        }
+                        finally
+                        {
+                            resolveProgressTask.Increment(1);
+                            resolveSemaphore.Release();
+                        }
+                    });
+                    await Task.WhenAll(resolveTasks);
+                });
 
-            Console.WriteLine("\n扫描完成，正在获取MAC地址...");
 
-            var arpCache = GetArpCache();
-            var results = new Dictionary<string, string>();
+            string localIp = ipAddress.ToString();
+            string localMac = FormatMacAddress(adapter.GetPhysicalAddress());
+            string localHostname = Dns.GetHostName();
 
-            foreach (var host in onlineHosts.OrderBy(h => h.GetAddressBytes(), new IPAddressComparer()))
+            var finalResults = results.ToList();
+            var localMachineResult = finalResults.FirstOrDefault(r => r.IpAddress == localIp);
+            if (localMachineResult != null)
             {
-                string ipStr = host.ToString();
-                if (arpCache.TryGetValue(ipStr, out string? macAddress))
-                {
-                    results[ipStr] = macAddress;
-                }
-                else
-                {
-                    results[ipStr] = "(无法获取)";
-                }
+                localMachineResult.MacAddress = localMac;
+                localMachineResult.Hostname = localHostname;
+            }
+            else
+            {
+                finalResults.Add(new ScanResult { IpAddress = localIp, MacAddress = localMac, Hostname = localHostname });
             }
 
-            PrintResultsTable(results);
+            PrintResultsTable(finalResults, localIp);
         }
-
 
         /// <summary>
         /// 将适配器设置为使用 DHCP。
         /// </summary>
         static void SetDhcpIP(string adapterName)
         {
-            Console.Clear();
-            Console.WriteLine();
-            Console.WriteLine($" 正在设置 \"{adapterName}\" 为自动获取 IP 地址 (DHCP)...");
+            AnsiConsole.Clear();
+            AnsiConsole.MarkupLine($"[yellow]正在设置 \"{Markup.Escape(adapterName)}\" 为自动获取 IP 地址 (DHCP)...[/]");
             if (!ExecuteNetsh($"interface ipv4 set address name=\"{adapterName}\" source=dhcp")) return;
 
-            Console.WriteLine($" 正在设置 \"{adapterName}\" 为自动获取 DNS 服务器 (DHCP)...");
+            AnsiConsole.MarkupLine($"[yellow]正在设置 \"{Markup.Escape(adapterName)}\" 为自动获取 DNS 服务器 (DHCP)...[/]");
             if (!ExecuteNetsh($"interface ipv4 set dns name=\"{adapterName}\" source=dhcp")) return;
 
             ShowSuccess(adapterName);
         }
 
         /// <summary>
-        /// 为适配器设置静态IP。
+        /// 为适配器设置静态IP，包含输入验证和ESC取消功能。
         /// </summary>
-        static void SetStaticIP(string adapterName)
+        /// <returns>如果操作成功完成则返回 true, 如果被用户取消则返回 false。</returns>
+        static bool SetStaticIP(string adapterName)
         {
-            Console.Clear();
-            Console.WriteLine();
-            Console.WriteLine($" 正在为 \"{adapterName}\" 配置静态 IP");
-            Console.WriteLine(" (直接按回车键即可使用中括号 [] 内的默认值)");
-            Console.WriteLine();
-            Console.WriteLine("---------------------------------------------------------");
-            Console.WriteLine();
+            AnsiConsole.Clear();
+            AnsiConsole.MarkupLine($"[bold]正在为 \"{Markup.Escape(adapterName)}\" 配置静态 IP[/]");
+            AnsiConsole.MarkupLine("[grey](在任何提示下按 ESC 键可取消操作)[/]");
+            AnsiConsole.WriteLine();
 
-            string staticIP;
+            string? staticIP;
             while (true)
             {
-                Console.Write("请输入静态 IP 地址: ");
-                staticIP = Console.ReadLine() ?? "";
-                if (!string.IsNullOrWhiteSpace(staticIP) && IsValidIp(staticIP)) break;
-                Console.WriteLine(" IP 地址不能为空或格式不正确。");
+                staticIP = GetInputWithCancel("[green]请输入静态 IP 地址: [/]");
+                if (staticIP is null) return false; // User cancelled
+                if (IsValidIpOrHostname(staticIP)) break;
+                AnsiConsole.MarkupLine("[red]IP 地址格式不正确，请重试。[/]");
             }
 
-            string defaultSubnet = "255.255.255.0";
             var ipParts = staticIP.Split('.');
-            string defaultGateway = $"{ipParts[0]}.{ipParts[1]}.{ipParts[2]}.1";
+            string defaultGatewayValue = ipParts.Length == 4 ? $"{ipParts[0]}.{ipParts[1]}.{ipParts[2]}.1" : "";
 
-            Console.Write($"请输入子网掩码 [默认: {defaultSubnet}]: ");
-            string subnetMask = Console.ReadLine() ?? "";
-            if (string.IsNullOrWhiteSpace(subnetMask)) subnetMask = defaultSubnet;
+            string? subnetMask;
+            while (true)
+            {
+                subnetMask = GetInputWithCancel($"[green]请输入子网掩码 [/][grey](默认: 255.255.255.0)[/][green]: [/]");
+                if (subnetMask is null) return false;
+                if (string.IsNullOrEmpty(subnetMask)) subnetMask = "255.255.255.0";
+                if (IsValidIp(subnetMask)) break;
+                AnsiConsole.MarkupLine("[red]子网掩码格式不正确，请重试。[/]");
+            }
 
-            Console.Write($"请输入网关 (如果不需要请留空) [默认: {defaultGateway}]: ");
-            string gateway = Console.ReadLine() ?? "";
-            if (string.IsNullOrWhiteSpace(gateway)) gateway = defaultGateway;
+            string? gateway;
+            while (true)
+            {
+                gateway = GetInputWithCancel($"[green]请输入网关 [/][grey](默认: {defaultGatewayValue}, 可留空)[/][green]: [/]");
+                if (gateway is null) return false;
+                if (string.IsNullOrEmpty(gateway)) gateway = defaultGatewayValue;
+                if (string.IsNullOrEmpty(gateway) || IsValidIp(gateway)) break;
+                AnsiConsole.MarkupLine("[red]网关地址格式不正确，请重试。[/]");
+            }
 
-            Console.WriteLine();
-            Console.WriteLine(" 正在应用 IP 配置...");
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[yellow]正在应用 IP 配置...[/]");
             string command = string.IsNullOrWhiteSpace(gateway)
                 ? $"interface ipv4 set address name=\"{adapterName}\" static {staticIP} {subnetMask}"
                 : $"interface ipv4 set address name=\"{adapterName}\" static {staticIP} {subnetMask} {gateway}";
-            if (!ExecuteNetsh(command)) return;
+            if (!ExecuteNetsh(command)) return false;
 
-            Console.WriteLine();
-            string defaultDns1 = "114.114.114.114";
-            string defaultDns2 = "8.8.8.8";
+            AnsiConsole.WriteLine();
+            string? dns1;
+            while (true)
+            {
+                dns1 = GetInputWithCancel("[green]请输入主 DNS 服务器 [/][grey](默认: 114.114.114.114)[/][green]: [/]");
+                if (dns1 is null) return false;
+                if (string.IsNullOrEmpty(dns1)) dns1 = "114.114.114.114";
+                if (IsValidIpOrHostname(dns1)) break;
+                AnsiConsole.MarkupLine("[red]DNS 服务器地址格式不正确，请重试。[/]");
+            }
 
-            Console.Write($"请输入主 DNS 服务器 [默认: {defaultDns1}]: ");
-            string dns1 = Console.ReadLine() ?? "";
-            if (string.IsNullOrWhiteSpace(dns1)) dns1 = defaultDns1;
+            string? dns2;
+            while (true)
+            {
+                dns2 = GetInputWithCancel("[green]请输入备用 DNS 服务器 [/][grey](默认: 8.8.8.8, 可留空)[/][green]: [/]");
+                if (dns2 is null) return false;
+                if (string.IsNullOrEmpty(dns2)) dns2 = "8.8.8.8";
+                if (string.IsNullOrEmpty(dns2) || IsValidIpOrHostname(dns2)) break;
+                AnsiConsole.MarkupLine("[red]DNS 服务器地址格式不正确，请重试。[/]");
+            }
 
-            Console.Write($"请输入备用 DNS 服务器 (可选) [默认: {defaultDns2}]: ");
-            string dns2 = Console.ReadLine() ?? "";
-            if (string.IsNullOrWhiteSpace(dns2)) dns2 = defaultDns2;
-
-            Console.WriteLine();
-            Console.WriteLine(" 正在应用 DNS 配置...");
-            if (!ExecuteNetsh($"interface ipv4 set dns name=\"{adapterName}\" static {dns1}")) return;
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[yellow]正在应用 DNS 配置...[/]");
+            if (!ExecuteNetsh($"interface ipv4 set dns name=\"{adapterName}\" static {dns1}")) return false;
 
             if (!string.IsNullOrWhiteSpace(dns2))
             {
@@ -340,6 +488,7 @@ namespace IPSwitcher
             }
 
             ShowSuccess(adapterName);
+            return true;
         }
 
         /// <summary>
@@ -347,12 +496,16 @@ namespace IPSwitcher
         /// </summary>
         static void ShowSuccess(string adapterName)
         {
-            Console.Clear();
-            Console.WriteLine("===================== 操作成功 =====================");
-            Console.WriteLine();
-            Console.WriteLine($" \"{adapterName}\" 的网络配置已更新。");
-            Console.WriteLine(" 以下为当前配置:");
-            Console.WriteLine("---------------------------------------------------------");
+            AnsiConsole.Clear();
+            var panel = new Panel($"[bold green]操作成功[/]\n\"{Markup.Escape(adapterName)}\" 的网络配置已更新。")
+                .Header("成功")
+                .Border(BoxBorder.Rounded)
+                .Expand();
+            AnsiConsole.Write(panel);
+
+            var table = new Table().Title("[bold]当前配置[/]").Border(TableBorder.Simple);
+            table.AddColumn("项目");
+            table.AddColumn("值");
 
             try
             {
@@ -362,7 +515,7 @@ namespace IPSwitcher
 
                 if (ni == null)
                 {
-                    Console.WriteLine(" 无法获取该适配器的详细信息。");
+                    AnsiConsole.MarkupLine("[red]无法获取该适配器的详细信息。[/]");
                     return;
                 }
 
@@ -372,214 +525,719 @@ namespace IPSwitcher
 
                 if (ipv4AddressInfo != null)
                 {
-                    Console.WriteLine($"   IPv4 地址 . . . . . . . . . . . : {ipv4AddressInfo.Address}");
-                    Console.WriteLine($"   子网掩码  . . . . . . . . . . . : {ipv4AddressInfo.IPv4Mask}");
+                    table.AddRow("IPv4 地址", ipv4AddressInfo.Address.ToString());
+                    table.AddRow("子网掩码", ipv4AddressInfo.IPv4Mask.ToString());
                 }
                 else
                 {
-                    Console.WriteLine("   IPv4 地址 . . . . . . . . . . . : (未分配)");
+                    table.AddRow("IPv4 地址", "[grey](未分配)[/]");
                 }
 
                 var gateway = ipProps.GatewayAddresses.FirstOrDefault(g => g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
-                Console.WriteLine($"   默认网关. . . . . . . . . . . : {(gateway != null ? gateway.Address.ToString() : "(无)")}");
+                table.AddRow("默认网关", gateway != null ? gateway.Address.ToString() : "[grey](无)[/]");
 
-                Console.WriteLine("   DNS 服务器. . . . . . . . . . . : ");
-                var dnsServers = ipProps.DnsAddresses.Where(d => d.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+                var dnsServers = ipProps.DnsAddresses.Where(d => d.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToList();
                 if (dnsServers.Any())
                 {
-                    foreach (var dns in dnsServers)
-                    {
-                        Console.WriteLine($"                                     {dns}");
-                    }
+                    table.AddRow("DNS 服务器", string.Join("\n", dnsServers.Select(d => d.ToString())));
                 }
                 else
                 {
-                    Console.WriteLine("                                     (无)");
+                    table.AddRow("DNS 服务器", "[grey](无)[/]");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($" 获取配置时出错: {ex.Message}");
+                AnsiConsole.MarkupLine($"[red]获取配置时出错: {Markup.Escape(ex.Message)}[/]");
             }
-            Console.WriteLine();
+            AnsiConsole.Write(table);
         }
+
+        #region 网络诊断工具
+
+        /// <summary>
+        /// 网络诊断工具的主菜单。
+        /// </summary>
+        static async Task NetworkDiagnosticsMenu()
+        {
+            while (true)
+            {
+                AnsiConsole.Clear();
+                var options = new List<string>
+                {
+                    "持续 Ping 监控",
+                    "路由跟踪",
+                    "端口扫描",
+                    "返回主菜单"
+                };
+
+                var choiceIndex = await ShowMenuAsync(options, "[bold]网络诊断工具[/]");
+
+                if (choiceIndex == -1 || choiceIndex == 3) return;
+
+                bool operationCompleted = false;
+                switch (choiceIndex)
+                {
+                    case 0:
+                        operationCompleted = await StartPingMonitor();
+                        break;
+                    case 1:
+                        operationCompleted = await StartTraceroute();
+                        break;
+                    case 2:
+                        operationCompleted = await StartPortScan();
+                        break;
+                }
+                if (operationCompleted)
+                {
+                    AnsiConsole.Prompt(new TextPrompt<string>("[grey]诊断完成。按任意键返回诊断菜单...[/]").AllowEmpty());
+                }
+            }
+        }
+
+        /// <summary>
+        /// 启动持续 Ping 监控。
+        /// </summary>
+        static async Task<bool> StartPingMonitor()
+        {
+            AnsiConsole.Clear();
+            string? target;
+            while (true)
+            {
+                target = GetInputWithCancel("[green]请输入目标 IP 地址或域名: [/]");
+                if (target is null) return false; // User cancelled
+                if (!string.IsNullOrWhiteSpace(target)) break;
+                AnsiConsole.MarkupLine("[red]目标不能为空，请重试。[/]");
+            }
+
+            AnsiConsole.MarkupLine($"\n正在持续 Ping [yellow]{Markup.Escape(target)}[/] ([grey]按 Esc 键停止[/])...");
+
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+
+            long packetsSent = 0;
+            long packetsReceived = 0;
+            var latencies = new List<long>();
+
+            var pingLoop = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        using var ping = new Ping();
+                        var reply = await ping.SendPingAsync(target, 2000);
+                        packetsSent++;
+
+                        if (reply.Status == IPStatus.Success)
+                        {
+                            packetsReceived++;
+                            latencies.Add(reply.RoundtripTime);
+                            var ttl = reply.Options?.Ttl;
+                            AnsiConsole.MarkupLine($"来自 [green]{reply.Address}[/]: 字节=32 时间=[yellow]{reply.RoundtripTime}ms[/] TTL=[blue]{ttl}[/]");
+                        }
+                        else
+                        {
+                            AnsiConsole.MarkupLine($"[yellow]请求超时或错误: {reply.Status}[/]");
+                        }
+                    }
+                    catch (PingException ex)
+                    {
+                        AnsiConsole.MarkupLine($"[red]Ping 错误: {Markup.Escape(ex.InnerException?.Message ?? ex.Message)}[/]");
+                        cts.Cancel();
+                    }
+                    catch (OperationCanceledException) { }
+
+                    if (!token.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            await Task.Delay(1000, token);
+                        }
+                        catch (TaskCanceledException) { }
+                    }
+                }
+            }, token);
+
+            while (!pingLoop.IsCompleted && !pingLoop.IsCanceled)
+            {
+                if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape)
+                {
+                    cts.Cancel();
+                }
+                await Task.Delay(100);
+            }
+
+            long packetsLost = packetsSent - packetsReceived;
+            double lossPercentage = packetsSent > 0 ? (double)packetsLost / packetsSent * 100 : 0;
+
+            var statsGrid = new Grid()
+                .AddColumn().AddColumn().AddColumn().AddColumn()
+                .AddRow(
+                    "[bold]已发送:[/] " + packetsSent,
+                    "[bold]已接收:[/] " + packetsReceived,
+                    "[bold]已丢失:[/] " + packetsLost,
+                    $"([bold red]{lossPercentage:F2}% 丢失[/])"
+                );
+
+            Panel panel;
+            if (latencies.Any())
+            {
+                var latencyGrid = new Grid()
+                    .AddColumn().AddColumn().AddColumn()
+                    .AddRow(
+                        $"[bold]最短:[/] {latencies.Min()}ms",
+                        $"[bold]最长:[/] {latencies.Max()}ms",
+                        $"[bold]平均:[/] {latencies.Average():F0}ms"
+                    );
+                var rows = new Rows(statsGrid, new Text("往返行程的估计时间(以毫秒为单位):"), latencyGrid);
+                panel = new Panel(rows).Header("[bold]Ping 统计信息[/]").Border(BoxBorder.Rounded);
+            }
+            else
+            {
+                panel = new Panel(statsGrid).Header("[bold]Ping 统计信息[/]").Border(BoxBorder.Rounded);
+            }
+            AnsiConsole.Write(panel);
+            return true;
+        }
+
+        /// <summary>
+        /// 启动路由跟踪。
+        /// </summary>
+        static async Task<bool> StartTraceroute()
+        {
+            AnsiConsole.Clear();
+            string? target;
+            while (true)
+            {
+                target = GetInputWithCancel("[green]请输入目标 IP 地址或域名: [/]");
+                if (target is null) return false; // User cancelled
+                if (!string.IsNullOrWhiteSpace(target)) break;
+                AnsiConsole.MarkupLine("[red]目标不能为空，请重试。[/]");
+            }
+
+            IPAddress targetIp;
+            try
+            {
+                var addresses = await Dns.GetHostAddressesAsync(target);
+                targetIp = addresses.First(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]无法解析目标: {Markup.Escape(ex.Message)}[/]");
+                return true; // Operation considered "complete" as it produced a result (an error message)
+            }
+
+            AnsiConsole.MarkupLine($"\n通过最多 30 个跃点跟踪到 [yellow]{Markup.Escape(target)}[/] [[[yellow]{targetIp}[/]]] 的路由:");
+
+            var table = new Table().Border(TableBorder.Simple);
+            table.AddColumn("跃点");
+            table.AddColumn("延迟");
+            table.AddColumn("IP 地址");
+            table.AddColumn("主机名");
+
+            await AnsiConsole.Live(table)
+                .StartAsync(async ctx =>
+                {
+                    const int maxHops = 30;
+                    const int timeout = 4000;
+
+                    for (int ttl = 1; ttl <= maxHops; ttl++)
+                    {
+                        using var ping = new Ping();
+                        var pingOptions = new PingOptions(ttl, true);
+                        var stopwatch = new Stopwatch();
+
+                        try
+                        {
+                            stopwatch.Start();
+                            var reply = await ping.SendPingAsync(targetIp, timeout, new byte[32], pingOptions);
+                            stopwatch.Stop();
+
+                            if (reply.Status == IPStatus.Success || reply.Status == IPStatus.TtlExpired)
+                            {
+                                string hostname;
+                                try
+                                {
+                                    var hostEntry = await Dns.GetHostEntryAsync(reply.Address);
+                                    hostname = Markup.Escape(hostEntry.HostName);
+                                }
+                                catch
+                                {
+                                    hostname = "[grey]N/A[/]";
+                                }
+
+                                table.AddRow(ttl.ToString(), $"[yellow]{stopwatch.ElapsedMilliseconds}ms[/]", $"[green]{reply.Address}[/]", hostname);
+                                ctx.Refresh();
+
+                                if (reply.Status == IPStatus.Success)
+                                {
+                                    table.Caption = new TableTitle("[bold green]跟踪完成[/]");
+                                    ctx.Refresh();
+                                    return;
+                                }
+                            }
+                            else
+                            {
+                                table.AddRow(ttl.ToString(), "*", "[grey]请求超时[/]", "");
+                                ctx.Refresh();
+                            }
+                        }
+                        catch (PingException)
+                        {
+                            table.AddRow(ttl.ToString(), "*", "[red]错误[/]", "");
+                            ctx.Refresh();
+                        }
+                    }
+                    table.Caption = new TableTitle("[bold yellow]跟踪已达到最大跃点数[/]");
+                    ctx.Refresh();
+                });
+            return true;
+        }
+
+        /// <summary>
+        /// 启动端口扫描。
+        /// </summary>
+        static async Task<bool> StartPortScan()
+        {
+            AnsiConsole.Clear();
+            string? target;
+            while (true)
+            {
+                target = GetInputWithCancel("[green]请输入目标 IP 地址: [/]");
+                if (target is null) return false; // User cancelled
+                if (IsValidIp(target)) break;
+                AnsiConsole.MarkupLine("[red]无效的 IP 地址，请重试。[/]");
+            }
+
+            string? portString;
+            while (true)
+            {
+                portString = GetInputWithCancel("[green]请输入要扫描的端口 (例如: 80, 443, 8000-8080): [/]");
+                if (portString is null) return false; // User cancelled
+                if (!string.IsNullOrWhiteSpace(portString)) break;
+                AnsiConsole.MarkupLine("[red]端口不能为空，请重试。[/]");
+            }
+
+            var portsToScan = ParsePorts(portString);
+
+            if (!portsToScan.Any())
+            {
+                AnsiConsole.MarkupLine("[yellow]没有要扫描的有效端口。[/]");
+                return true;
+            }
+
+            AnsiConsole.MarkupLine($"\n正在扫描 [yellow]{Markup.Escape(target)}[/] 上的端口...");
+
+            var openPorts = new ConcurrentBag<int>();
+
+            await AnsiConsole.Progress()
+                .Columns(new ProgressColumn[]
+                {
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                    new SpinnerColumn(),
+                })
+                .StartAsync(async ctx =>
+                {
+                    var task = ctx.AddTask("[green]扫描进度[/]", new ProgressTaskSettings { MaxValue = portsToScan.Count });
+                    var semaphore = new SemaphoreSlim(100);
+
+                    var scanTasks = portsToScan.Select(async port =>
+                    {
+                        await semaphore.WaitAsync();
+                        try
+                        {
+                            using (var client = new TcpClient())
+                            {
+                                var connectTask = client.ConnectAsync(target!, port);
+                                if (await Task.WhenAny(connectTask, Task.Delay(1000)) == connectTask && !connectTask.IsFaulted)
+                                {
+                                    openPorts.Add(port);
+                                }
+                            }
+                        }
+                        catch { }
+                        finally
+                        {
+                            task.Increment(1);
+                            semaphore.Release();
+                        }
+                    });
+                    await Task.WhenAll(scanTasks);
+                });
+
+            AnsiConsole.WriteLine();
+            var table = new Table().Title("[bold]扫描结果[/]").Border(TableBorder.Simple);
+            table.AddColumn(new TableColumn("开放的端口").Centered());
+
+            if (openPorts.Any())
+            {
+                foreach (var port in openPorts.OrderBy(p => p))
+                {
+                    table.AddRow($"[green]{port}[/]");
+                }
+            }
+            else
+            {
+                table.AddRow("[grey]未发现开放端口[/]");
+            }
+            AnsiConsole.Write(table);
+            return true;
+        }
+
+        #endregion
 
         #region 辅助方法
 
         /// <summary>
+        /// 优化: 实现一个可被 ESC 键取消的自定义文本输入方法。
+        /// </summary>
+        private static string? GetInputWithCancel(string promptMarkup)
+        {
+            AnsiConsole.Markup(promptMarkup);
+            Console.CursorVisible = true;
+            var input = new StringBuilder();
+
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+
+                if (key.Key == ConsoleKey.Escape)
+                {
+                    Console.CursorVisible = false;
+                    AnsiConsole.WriteLine();
+                    return null;
+                }
+
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    Console.CursorVisible = false;
+                    AnsiConsole.WriteLine();
+                    return input.ToString();
+                }
+
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (input.Length > 0)
+                    {
+                        input.Length--;
+                        Console.Write("\b \b");
+                    }
+                }
+                else if (!char.IsControl(key.KeyChar))
+                {
+                    input.Append(key.KeyChar);
+                    Console.Write(key.KeyChar);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 创建一个通用的、无闪烁的、响应迅速的菜单渲染方法，支持ESC退出。
+        /// </summary>
+        static Task<int> ShowMenuAsync(List<string> options, string title)
+        {
+            int selectedIndex = 0;
+            var chosenIndex = -1;
+
+            AnsiConsole.Live(new Grid())
+                .Start(ctx =>
+                {
+                    IRenderable BuildMenuRenderable()
+                    {
+                        var menuItems = new List<IRenderable>
+                        {
+                            new Markup(title),
+                            new Markup("[grey](使用 ↑/↓ 或数字键选择)[/]"),
+                            new Markup("[grey](Enter 确认, Esc 返回)[/]"),
+                            Text.Empty
+                        };
+
+                        for (int i = 0; i < options.Count; i++)
+                        {
+                            // 直接使用选项字符串，不再错误地转义它
+                            var text = options[i];
+                            if (i == selectedIndex)
+                            {
+                                menuItems.Add(new Markup($"[cyan]>[/] [underline blue]{i + 1}. {text}[/]"));
+                            }
+                            else
+                            {
+                                menuItems.Add(new Markup($"  {i + 1}. {text}"));
+                            }
+                        }
+                        var menuRenderable = new Padder(new Rows(menuItems), new Padding(1, 1, 1, 1));
+                        return new Grid().AddColumn().AddRow(menuRenderable);
+                    }
+
+                    ctx.UpdateTarget(BuildMenuRenderable());
+                    ctx.Refresh();
+
+                    while (true)
+                    {
+                        var keyInfo = Console.ReadKey(true);
+                        bool selectionMade = false;
+
+                        switch (keyInfo.Key)
+                        {
+                            case ConsoleKey.UpArrow:
+                                selectedIndex = (selectedIndex - 1 + options.Count) % options.Count;
+                                break;
+                            case ConsoleKey.DownArrow:
+                                selectedIndex = (selectedIndex + 1) % options.Count;
+                                break;
+                            case ConsoleKey.Enter:
+                                chosenIndex = selectedIndex;
+                                selectionMade = true;
+                                break;
+                            case ConsoleKey.Escape:
+                                chosenIndex = -1;
+                                selectionMade = true;
+                                break;
+                            default:
+                                if (char.IsDigit(keyInfo.KeyChar))
+                                {
+                                    if (int.TryParse(keyInfo.KeyChar.ToString(), out int numChoice) && numChoice > 0 && numChoice <= options.Count)
+                                    {
+                                        chosenIndex = numChoice - 1;
+                                        selectionMade = true;
+                                    }
+                                }
+                                break;
+                        }
+
+                        if (selectionMade)
+                        {
+                            break;
+                        }
+
+                        ctx.UpdateTarget(BuildMenuRenderable());
+                        ctx.Refresh();
+                    }
+                });
+
+            return Task.FromResult(chosenIndex);
+        }
+
+        /// <summary>
+        /// [已修复] 主菜单显示逻辑，通过缓存昂贵的系统调用结果来解决UI迟滞问题。
+        /// </summary>
+        static async Task<int> ShowMainMenuWithOptions(List<string> options)
+        {
+            int selectedIndex = 0;
+            int chosenIndex = -1;
+
+            // [修复] 在进入实时显示循环之前，一次性获取耗时的适配器信息。
+            var activeAdapter = AdapterInfo.GetActiveAdapter();
+
+            await AnsiConsole.Live(new Grid())
+                .StartAsync(async ctx =>
+                {
+                    // 辅助方法，用于构建完整的UI布局。它现在使用从父作用域捕获的、缓存的'activeAdapter'。
+                    IRenderable BuildLayout()
+                    {
+                        var menuItems = new List<IRenderable>
+                        {
+                            new Markup("[bold]您希望执行什么操作?[/]"),
+                            new Markup("[grey](使用 ↑/↓ 或数字键选择)[/]"),
+                            new Markup("[grey](Enter 确认, Esc 退出)[/]"),
+                            Text.Empty
+                        };
+
+                        for (int i = 0; i < options.Count; i++)
+                        {
+                            var text = Markup.Escape(options[i]);
+                            if (i == selectedIndex)
+                            {
+                                menuItems.Add(new Markup($"[cyan]>[/] [underline blue]{i + 1}. {text}[/]"));
+                            }
+                            else
+                            {
+                                menuItems.Add(new Markup($"  {i + 1}. {text}"));
+                            }
+                        }
+                        var menuRenderable = new Padder(new Rows(menuItems), new Padding(1, 1, 1, 1));
+
+                        // [修复] 使用新的 GetLocalInfoGrid(AdapterInfo) 方法，传入缓存的数据。
+                        var localPanel = new Panel(GetLocalInfoGrid(activeAdapter)).Header("[bold blue]本地网络信息[/]").Border(BoxBorder.Rounded);
+                        var publicPanel = new Panel(GetPublicInfoGrid()).Header("[bold green]公网信息[/]").Border(BoxBorder.Rounded);
+                        var infoGrid = new Grid().AddColumn().AddColumn().AddRow(localPanel, publicPanel);
+
+                        return new Rows(infoGrid, menuRenderable);
+                    }
+
+                    var stopwatch = Stopwatch.StartNew();
+                    var refreshInterval = TimeSpan.FromMilliseconds(500); // 动态数据刷新间隔
+
+                    // 首次渲染
+                    ctx.UpdateTarget(BuildLayout());
+                    ctx.Refresh();
+
+                    bool exitLoop = false;
+                    while (!exitLoop)
+                    {
+                        // 优先处理所有待处理的按键输入，以实现即时响应
+                        while (Console.KeyAvailable)
+                        {
+                            var keyInfo = Console.ReadKey(true);
+                            switch (keyInfo.Key)
+                            {
+                                case ConsoleKey.UpArrow:
+                                    selectedIndex = (selectedIndex - 1 + options.Count) % options.Count;
+                                    break;
+                                case ConsoleKey.DownArrow:
+                                    selectedIndex = (selectedIndex + 1) % options.Count;
+                                    break;
+                                case ConsoleKey.Enter:
+                                    chosenIndex = selectedIndex;
+                                    exitLoop = true;
+                                    break;
+                                case ConsoleKey.Escape:
+                                    chosenIndex = -1;
+                                    exitLoop = true;
+                                    break;
+                                default:
+                                    if (char.IsDigit(keyInfo.KeyChar))
+                                    {
+                                        if (int.TryParse(keyInfo.KeyChar.ToString(), out int numChoice) && numChoice > 0 && numChoice <= options.Count)
+                                        {
+                                            chosenIndex = numChoice - 1;
+                                            exitLoop = true;
+                                        }
+                                    }
+                                    break;
+                            }
+
+                            if (exitLoop) break;
+
+                            // 每次按键后立即重新渲染，以提供快速的视觉反馈
+                            ctx.UpdateTarget(BuildLayout());
+                            ctx.Refresh();
+                            stopwatch.Restart(); // 按键后重置定时器
+                        }
+
+                        if (exitLoop) break;
+
+                        // 如果没有按键，检查是否到了为动态数据（时钟等）进行定期刷新的时间
+                        if (stopwatch.Elapsed > refreshInterval)
+                        {
+                            ctx.UpdateTarget(BuildLayout());
+                            ctx.Refresh();
+                            stopwatch.Restart();
+                        }
+
+                        // 在主循环中进行短暂的等待，以防止在空闲时占用100%的CPU
+                        await Task.Delay(10);
+                    }
+                });
+
+            return chosenIndex;
+        }
+
+
+        /// <summary>
         /// 提示用户选择一个网络适配器。
         /// </summary>
-        static string? SelectAdapter(string prompt)
+        static async Task<string?> SelectAdapter(string prompt)
         {
             var adapters = AdapterInfo.GetAvailableAdapters();
             if (!adapters.Any())
             {
-                Console.Clear();
-                Console.WriteLine("未找到已连接的网络适配器。");
-                Console.WriteLine("请确保网络已连接，或以管理员权限运行本程序。");
-                Console.ReadKey();
+                AnsiConsole.Clear();
+                AnsiConsole.MarkupLine("[red]未找到已连接的网络适配器。[/]");
+                AnsiConsole.MarkupLine("[yellow]请确保网络已连接，或以管理员权限运行本程序。[/]");
+                AnsiConsole.Prompt(new TextPrompt<string>("[grey]按任意键继续...[/]").AllowEmpty());
                 return null;
             }
 
-            var adapterDisplayList = adapters.Select(a => a.Display).ToList();
+            var displayList = adapters.Select(a => a.Display).ToList();
+            displayList.Add("  返回主菜单");
 
-            int defaultChoice = adapters.FindIndex(a => a.IsActive);
-            if (defaultChoice == -1) defaultChoice = 0;
+            var choiceIndex = await ShowMenuAsync(displayList, $"[bold]{prompt}[/]");
 
-            var title = $"===== {prompt} =====";
-            int selectedIndex = GetInteractiveMenuChoice(() => Console.WriteLine(title), adapterDisplayList, defaultChoice + 1);
+            if (choiceIndex == -1 || choiceIndex >= adapters.Count)
+            {
+                return null;
+            }
 
-            if (selectedIndex == -1) return null; // 用户按下了 Esc
-            return adapters[selectedIndex - 1].Name;
+            return adapters[choiceIndex].Name;
         }
 
         /// <summary>
-        /// 提供一个可通过箭头和Enter键选择的交互式菜单。
-        /// </summary>
-        /// <returns>返回选中项从1开始的索引，如果按下Esc则返回-1。</returns>
-        static int GetInteractiveMenuChoice(Action drawPrompt, List<string> options, int defaultChoice)
-        {
-            int selectedIndex = defaultChoice - 1;
-            ConsoleKeyInfo key;
-            var timer = new System.Timers.Timer(1000);
-
-            Console.CursorVisible = false;
-
-            // 绘制静态框架
-            Console.Clear();
-            drawPrompt();
-            Console.WriteLine();
-
-            // 预留选项的位置
-            int menuTop = Console.CursorTop;
-            for (int i = 0; i < options.Count; i++)
-            {
-                Console.WriteLine(new string(' ', Console.WindowWidth));
-            }
-            Console.WriteLine("\n(使用 ↑/↓ 箭头选择, Enter 确认, Esc 返回/退出)");
-
-            Action<int> drawOption = (index) =>
-            {
-                Console.SetCursorPosition(0, menuTop + index);
-                if (index == selectedIndex)
-                {
-                    Console.BackgroundColor = ConsoleColor.DarkCyan;
-                    Console.ForegroundColor = ConsoleColor.White;
-                    Console.Write($" > {options[index]}");
-                    Console.ResetColor();
-                }
-                else
-                {
-                    Console.Write($"   {options[index]}");
-                }
-                // 清除行尾可能存在的旧字符
-                Console.Write(new string(' ', Console.WindowWidth - Console.CursorLeft));
-            };
-
-            for (int i = 0; i < options.Count; i++)
-            {
-                drawOption(i);
-            }
-
-            timer.Elapsed += (sender, e) => UpdateDashboard();
-            if (drawPrompt.Method.Name.Contains("Dashboard"))
-            {
-                timer.Start();
-            }
-
-            while (true)
-            {
-                key = Console.ReadKey(true);
-
-                int previousIndex = selectedIndex;
-
-                switch (key.Key)
-                {
-                    case ConsoleKey.UpArrow:
-                        selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : options.Count - 1;
-                        break;
-                    case ConsoleKey.DownArrow:
-                        selectedIndex = (selectedIndex < options.Count - 1) ? selectedIndex + 1 : 0;
-                        break;
-                    case ConsoleKey.Enter:
-                        timer.Stop();
-                        Console.CursorVisible = true;
-                        Console.Clear();
-                        return selectedIndex + 1;
-                    case ConsoleKey.Escape:
-                        timer.Stop();
-                        Console.CursorVisible = true;
-                        Console.Clear();
-                        return -1;
-                    default:
-                        if (char.IsDigit(key.KeyChar))
-                        {
-                            if (int.TryParse(key.KeyChar.ToString(), out int numChoice) && numChoice > 0 && numChoice <= options.Count)
-                            {
-                                timer.Stop();
-                                Console.CursorVisible = true;
-                                Console.Clear();
-                                return numChoice;
-                            }
-                        }
-                        break;
-                }
-
-                if (previousIndex != selectedIndex)
-                {
-                    drawOption(previousIndex);
-                    drawOption(selectedIndex);
-                }
-            }
-        }
-
-        /// <summary>
-        /// 执行 netsh 命令并捕获错误。
+        /// 执行 netsh 命令并对常见错误进行友好提示。
         /// </summary>
         static bool ExecuteNetsh(string arguments)
         {
-            using (Process p = new Process())
+            try
             {
-                p.StartInfo.FileName = "netsh.exe";
-                p.StartInfo.Arguments = arguments;
-                p.StartInfo.UseShellExecute = false;
-                p.StartInfo.RedirectStandardOutput = true;
-                p.StartInfo.RedirectStandardError = true;
-                p.StartInfo.CreateNoWindow = true;
-                p.StartInfo.StandardOutputEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
-                p.StartInfo.StandardErrorEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
-
-                p.Start();
-                string output = p.StandardOutput.ReadToEnd();
-                string error = p.StandardError.ReadToEnd();
-                p.WaitForExit();
-
-                if (p.ExitCode != 0)
+                using (Process p = new Process())
                 {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("\n--- NETSH 命令执行失败 ---");
-                    Console.WriteLine($"错误代码: {p.ExitCode}");
-                    if (!string.IsNullOrWhiteSpace(output)) Console.WriteLine($"输出信息: {output.Trim()}");
-                    if (!string.IsNullOrWhiteSpace(error)) Console.WriteLine($"错误详情: {error.Trim()}");
-                    Console.WriteLine("--------------------------");
-                    Console.ResetColor();
-                    Console.WriteLine("请检查命令或确保以管理员权限运行。按任意键继续...");
-                    Console.ReadKey();
-                    return false;
+                    p.StartInfo.FileName = "netsh.exe";
+                    p.StartInfo.Arguments = arguments;
+                    p.StartInfo.UseShellExecute = false;
+                    p.StartInfo.RedirectStandardOutput = true;
+                    p.StartInfo.RedirectStandardError = true;
+                    p.StartInfo.CreateNoWindow = true;
+                    p.StartInfo.StandardOutputEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+                    p.StartInfo.StandardErrorEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+
+                    p.Start();
+                    string output = p.StandardOutput.ReadToEnd();
+                    string error = p.StandardError.ReadToEnd();
+                    p.WaitForExit();
+
+                    if (p.ExitCode != 0)
+                    {
+                        AnsiConsole.WriteLine();
+                        var panel = new Panel(GetErrorMessage(error, output))
+                            .Header("[bold red]NETSH 命令执行失败[/]")
+                            .Border(BoxBorder.Rounded);
+                        AnsiConsole.Write(panel);
+                        return false;
+                    }
+                    return true;
                 }
-                return true;
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]执行 netsh 时发生意外错误: {Markup.Escape(ex.Message)}[/]");
+                return false;
             }
         }
 
+        static string GetErrorMessage(string error, string output)
+        {
+            string errorMessage = string.IsNullOrWhiteSpace(error) ? output.Trim() : error.Trim();
+            if (errorMessage.Contains("requires elevation") || errorMessage.Contains("请求的操作需要提升"))
+                return "[red]错误: 权限不足。\n请尝试以管理员身份运行此程序。[/]";
+            if (errorMessage.Contains("Element not found") || errorMessage.Contains("找不到元素"))
+                return "[red]错误: 网络适配器名称无效或不存在。[/]";
+            if (errorMessage.Contains("syntax of the command is incorrect") || errorMessage.Contains("命令的语法不正确"))
+                return "[red]错误: 命令语法不正确。请检查输入的值是否有效。[/]";
+            if (errorMessage.Contains("object with this name already exists") || errorMessage.Contains("同名的对象已存在"))
+                return "[red]错误: 对象已存在。\n例如，您可能尝试添加一个已经存在的 DNS 服务器地址。[/]";
+            return $"[red]未知错误:\n{Markup.Escape(errorMessage)}[/]";
+        }
+
+
         /// <summary>
-        /// 验证IP地址格式是否正确。
+        /// 验证字符串是否为有效的IPv4地址。
         /// </summary>
-        static bool IsValidIp(string ip)
+        static bool IsValidIp(string? ip)
         {
             if (string.IsNullOrWhiteSpace(ip)) return false;
-            var parts = ip.Split('.');
-            if (parts.Length != 4) return false;
-            return parts.All(part => byte.TryParse(part, out _));
+            return IPAddress.TryParse(ip, out _);
+        }
+
+        /// <summary>
+        /// 验证字符串是否为有效的IPv4地址或主机名。
+        /// </summary>
+        static bool IsValidIpOrHostname(string? host)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            return Uri.CheckHostName(host) != UriHostNameType.Unknown;
         }
 
         #endregion
@@ -587,54 +1245,34 @@ namespace IPSwitcher
         #region 扫描器与UI辅助方法
 
         /// <summary>
-        /// 打印对齐的扫描结果表格。
+        /// 打印包含主机名的对齐扫描结果表格。
         /// </summary>
-        private static void PrintResultsTable(Dictionary<string, string> results)
+        private static void PrintResultsTable(List<ScanResult> results, string localIp)
         {
-            const int ipWidth = 20;
-            const int macWidth = 22;
-
-            string ipHeader = "IP 地址";
-            string macHeader = "MAC 地址";
-
-            string header = $"│ {PadRightForMixedChars(ipHeader, ipWidth)} │ {PadRightForMixedChars(macHeader, macWidth)} │";
-            string separator = $"├{new string('─', ipWidth + 2)}┼{new string('─', macWidth + 2)}┤";
-
-            Console.WriteLine("\n┌" + new string('─', ipWidth + 2) + "┬" + new string('─', macWidth + 2) + "┐");
-            Console.WriteLine(header);
-            Console.WriteLine(separator);
+            var table = new Table().Expand().Border(TableBorder.Rounded);
+            table.Title = new TableTitle("[bold blue]局域网扫描结果[/]");
+            table.AddColumn("[bold]IP 地址[/]");
+            table.AddColumn("[bold]MAC 地址[/]");
+            table.AddColumn("[bold]主机名[/]");
 
             if (results.Any())
             {
-                foreach (var entry in results)
+                var sortedResults = results.OrderBy(r => IPAddress.Parse(r.IpAddress).GetAddressBytes(), new IPAddressComparer());
+                foreach (var entry in sortedResults)
                 {
-                    Console.WriteLine($"│ {entry.Key,-ipWidth} │ {entry.Value,-macWidth} │");
+                    var rowStyle = entry.IpAddress == localIp ? new Style(Color.Cyan1, decoration: Decoration.Bold) : Style.Plain;
+                    table.AddRow(
+                        new Markup(entry.IpAddress, rowStyle),
+                        new Markup(entry.MacAddress, rowStyle),
+                        new Markup(Markup.Escape(entry.Hostname), rowStyle)
+                    );
                 }
             }
             else
             {
-                string noDeviceMsg = "未发现任何在线设备。";
-                Console.WriteLine($"│ {PadRightForMixedChars(noDeviceMsg, ipWidth + macWidth + 3)} │");
+                table.AddRow("[grey]未发现任何在线设备。[/]", "", "");
             }
-            Console.WriteLine("└" + new string('─', ipWidth + 2) + "┴" + new string('─', macWidth + 2) + "┘\n");
-        }
-
-        /// <summary>
-        /// 计算字符串在控制台的显示宽度 (一个中文字符宽度为2)。
-        /// </summary>
-        private static int GetVisibleLength(string str)
-        {
-            return str.Sum(c => Regex.IsMatch(c.ToString(), @"[\u4e00-\u9fa5]") ? 2 : 1);
-        }
-
-        /// <summary>
-        /// 填充字符串以使其在混合中/英文字符时对齐。
-        /// </summary>
-        private static string PadRightForMixedChars(string str, int totalWidth)
-        {
-            int currentWidth = GetVisibleLength(str);
-            int padding = totalWidth - currentWidth;
-            return str + new string(' ', padding > 0 ? padding : 0);
+            AnsiConsole.Write(table);
         }
 
         /// <summary>
@@ -654,7 +1292,8 @@ namespace IPSwitcher
             uint startIp = BitConverter.ToUInt32(networkBytes.Reverse().ToArray(), 0);
             uint endIp = BitConverter.ToUInt32(broadcastBytes.Reverse().ToArray(), 0);
 
-            if (startIp + 1 <= endIp - 1)
+            // 确保我们不会扫描网络和广播地址
+            if (endIp > startIp + 1)
             {
                 for (uint i = startIp + 1; i < endIp; i++)
                 {
@@ -683,64 +1322,65 @@ namespace IPSwitcher
                     string output = p.StandardOutput.ReadToEnd();
                     p.WaitForExit();
 
-                    var matches = Regex.Matches(output, @"\s*([0-9\.]+)\s+([0-9a-fA-F\-]+)\s+");
-                    foreach (Match match in matches)
+                    var matches = Regex.Matches(output, @"\s+([0-9\.]+)\s+([0-9a-fA-F\-]+)\s+");
+                    foreach (Match match in matches.Cast<Match>())
                     {
-                        cache[match.Groups[1].Value] = match.Groups[2].Value.ToUpper();
+                        if (match.Groups.Count == 3)
+                        {
+                            cache[match.Groups[1].Value.Trim()] = match.Groups[2].Value.Trim().ToUpper();
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"获取ARP缓存失败: {ex.Message}");
+                AnsiConsole.MarkupLine($"[red]获取ARP缓存失败: {Markup.Escape(ex.Message)}[/]");
             }
             return cache;
         }
 
         /// <summary>
-        /// 初始化性能计数器。
+        /// 将 PhysicalAddress 对象格式化为 XX-XX-XX-XX-XX-XX 格式的字符串。
         /// </summary>
-        private static void InitializePerformanceCounters()
+        private static string FormatMacAddress(PhysicalAddress address)
         {
-#if NETFRAMEWORK || WINDOWS
-            try
-            {
-                _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                _ramCounter = new PerformanceCounter("Memory", "% Committed Bytes In Use");
-                // 首次调用以获取初始值
-                _cpuCounter.NextValue();
-                _ramCounter.NextValue();
-            }
-            catch (Exception ex)
-            {
-                Console.Clear();
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("警告: 性能计数器初始化失败。");
-                Console.WriteLine("CPU和RAM使用率将不可用。");
-                Console.WriteLine("\n可能的原因及解决方案:");
-                Console.WriteLine(" 1. 权限不足: 请确保以管理员权限运行本程序。");
-                Console.WriteLine(" 2. 缺少依赖: (如果使用.NET Core/5+) 请确保已为项目添加 System.Diagnostics.PerformanceCounter NuGet包。");
-                Console.WriteLine(" 3. 系统计数器损坏: 可以尝试在管理员CMD或PowerShell中运行 'lodctr /r' 命令来重建系统性能计数器。");
-                Console.WriteLine($"\n错误详情: {ex.Message}");
-                Console.ResetColor();
-                Console.WriteLine("\n按任意键继续...");
-                Console.ReadKey();
-
-                _cpuCounter = null;
-                _ramCounter = null;
-            }
-#endif
+            if (address == null) return "(N/A)";
+            var bytes = address.GetAddressBytes();
+            if (bytes == null || bytes.Length == 0) return "(N/A)";
+            return string.Join("-", bytes.Select(b => b.ToString("X2")));
         }
 
         /// <summary>
-        /// 释放性能计数器资源。
+        /// 解析端口字符串 (例如 "80,443,8000-8080") 为一个整数列表。
         /// </summary>
-        private static void DisposePerformanceCounters()
+        private static List<int> ParsePorts(string? portString)
         {
-#if NETFRAMEWORK || WINDOWS
-            _cpuCounter?.Dispose();
-            _ramCounter?.Dispose();
-#endif
+            var ports = new HashSet<int>();
+            if (string.IsNullOrWhiteSpace(portString)) return new List<int>();
+
+            foreach (var part in portString.Split(','))
+            {
+                var trimmedPart = part.Trim();
+                if (trimmedPart.Contains('-'))
+                {
+                    var rangeParts = trimmedPart.Split('-');
+                    if (rangeParts.Length == 2 && int.TryParse(rangeParts[0], out int start) && int.TryParse(rangeParts[1], out int end) && start <= end)
+                    {
+                        for (int i = start; i <= end; i++)
+                        {
+                            if (i > 0 && i < 65536) ports.Add(i);
+                        }
+                    }
+                }
+                else
+                {
+                    if (int.TryParse(trimmedPart, out int port))
+                    {
+                        if (port > 0 && port < 65536) ports.Add(port);
+                    }
+                }
+            }
+            return ports.ToList();
         }
 
         /// <summary>
@@ -748,7 +1388,6 @@ namespace IPSwitcher
         /// </summary>
         private class IPAddressComparer : IComparer<byte[]?>
         {
-            // 修复警告 CS8767: 允许参数为可空类型
             public int Compare(byte[]? x, byte[]? y)
             {
                 if (x == null && y == null) return 0;
@@ -792,20 +1431,20 @@ namespace IPSwitcher
             IpAddress = ni.GetIPProperties().UnicastAddresses
                 .FirstOrDefault(addr => addr.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)?.Address.ToString() ?? "N/A";
 
-            // 修复警告: 在构造函数中初始化 Display 属性
             Display = string.Empty;
+            SetDisplay();
         }
 
         /// <summary>
-        /// 在排序后设置正确的显示编号。
+        /// 设置显示名称
         /// </summary>
-        public void SetDisplayIndex(int index)
+        public void SetDisplay()
         {
-            string prefix = IsActive ? "* [活动]" : "  [普通]";
-            if (IsVirtual) prefix = "  [虚拟]";
-            if (IsActive && IsVirtual) prefix = "* [虚拟]";
-
-            Display = $"{prefix} [{index}] {Name}";
+            string prefix = IsActive ? "[green]*[/]" : " ";
+            string type = IsVirtual ? "[grey](虚拟)[/]" : "";
+            // 优化: 为活动适配器添加明确的 "(活动)" 标识
+            string activeMarker = IsActive ? " [green](活动)[/]" : "";
+            Display = $"{prefix} {Markup.Escape(Name)} {type}{activeMarker}";
         }
 
         /// <summary>
@@ -818,7 +1457,7 @@ namespace IPSwitcher
             {
                 var allInterfaces = NetworkInterface.GetAllNetworkInterfaces();
                 var activeInterfaceIndex = allInterfaces
-                    .FirstOrDefault(ni => ni.GetIPProperties().GatewayAddresses
+                    .FirstOrDefault(ni => ni.OperationalStatus == OperationalStatus.Up && ni.GetIPProperties().GatewayAddresses
                     .Any(g => g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork))?.GetIPProperties().GetIPv4Properties()?.Index ?? -1;
 
                 foreach (NetworkInterface ni in allInterfaces)
@@ -834,19 +1473,13 @@ namespace IPSwitcher
             }
             catch (Exception ex)
             {
-                Console.WriteLine($" 扫描网络适配器时出错: {ex.Message}");
+                AnsiConsole.MarkupLine($"[red]扫描网络适配器时出错: {Markup.Escape(ex.Message)}[/]");
             }
 
-            var sortedAdapters = adapterInfos
+            return adapterInfos
                 .OrderBy(a => a.IsVirtual)
                 .ThenByDescending(a => a.IsActive)
                 .ToList();
-
-            for (int i = 0; i < sortedAdapters.Count; i++)
-            {
-                sortedAdapters[i].SetDisplayIndex(i + 1);
-            }
-            return sortedAdapters;
         }
 
         /// <summary>
