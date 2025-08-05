@@ -1415,6 +1415,7 @@ namespace IPSwitcher
     public class AdapterInfo
     {
         public string Name { get; }
+        public string Description { get; } // 新增：用于存储网卡的详细描述
         public bool IsActive { get; }
         public bool IsVirtual { get; }
         public string Display { get; private set; }
@@ -1423,6 +1424,7 @@ namespace IPSwitcher
         public AdapterInfo(NetworkInterface ni, int activeInterfaceIndex)
         {
             Name = ni.Name;
+            Description = ni.Description; // 新增：将网卡描述赋值给新属性
             IsActive = ni.GetIPProperties().GetIPv4Properties()?.Index == activeInterfaceIndex;
 
             string desc = ni.Description.ToLower();
@@ -1436,15 +1438,20 @@ namespace IPSwitcher
         }
 
         /// <summary>
-        /// 设置显示名称
+        /// 优化后的方法：设置包含详细描述的显示名称
         /// </summary>
         public void SetDisplay()
         {
             string prefix = IsActive ? "[green]*[/]" : " ";
-            string type = IsVirtual ? "[grey](虚拟)[/]" : "";
-            // 优化: 为活动适配器添加明确的 "(活动)" 标识
-            string activeMarker = IsActive ? " [green](活动)[/]" : "";
-            Display = $"{prefix} {Markup.Escape(Name)} {type}{activeMarker}";
+            var markers = new List<string>();
+            if (IsActive) markers.Add("[green](活动)[/]");
+            if (IsVirtual) markers.Add("[grey](虚拟)[/]");
+
+            string markerString = string.Join(" ", markers);
+
+            // 使用 Markup.Escape 防止网卡描述中的特殊字符（如'['）破坏 Spectre.Console 的格式
+            // 使用 [dim]...[/] 样式让描述文字颜色变暗，突出重点
+            Display = $"{prefix} {Markup.Escape(Name)} {markerString} - [dim]{Markup.Escape(Description)}[/]";
         }
 
         /// <summary>

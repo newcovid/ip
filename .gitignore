@@ -1,0 +1,27 @@
+# Visual Studio / .NET
+
+## 忽略编译输出
+[Bb]in/
+[Oo]bj/
+
+## 忽略 Visual Studio 相关的临时文件和目录
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+## 忽略 NuGet 包目录
+packages/
+*.nupkg
+
+## 忽略测试结果
+TestResults/
+*.trx
+
+## 忽略本地配置文件 (如果你的应用有的话)
+appsettings.Development.json
+
+## 忽略其他工具和编辑器产生的目录
+.vscode/
+.idea/
