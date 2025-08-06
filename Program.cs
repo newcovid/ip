@@ -302,75 +302,123 @@ namespace IPSwitcher
 
             AnsiConsole.MarkupLine($"[bold]本机IP:[/] [yellow]{ipAddress}[/], [bold]正在扫描网段:[/] [yellow]{networkAddress} / {subnetMask}[/]");
             AnsiConsole.MarkupLine($"[bold]扫描范围:[/] [yellow]{ipRange.First()} - {ipRange.Last()}[/]");
+            AnsiConsole.MarkupLine("[grey](按 Esc 键可随时中断)[/]");
+
 
             var onlineHosts = new ConcurrentBag<IPAddress>();
             var results = new ConcurrentBag<ScanResult>();
+            bool wasCancelled = false;
 
-            await AnsiConsole.Progress()
-                .Columns(new ProgressColumn[]
-                {
-                    new TaskDescriptionColumn(),
-                    new ProgressBarColumn(),
-                    new PercentageColumn(),
-                    new SpinnerColumn(),
-                })
-                .StartAsync(async ctx =>
-                {
-                    var pingProgressTask = ctx.AddTask("[green]Ping 扫描[/]", new ProgressTaskSettings { MaxValue = ipRange.Count });
-                    var pingSemaphore = new SemaphoreSlim(100);
-                    var pingTasks = ipRange.Select(async ip =>
-                    {
-                        await pingSemaphore.WaitAsync();
-                        try
-                        {
-                            using (var ping = new Ping())
-                            {
-                                var reply = await ping.SendPingAsync(ip, 1000);
-                                if (reply.Status == IPStatus.Success)
-                                {
-                                    onlineHosts.Add(ip);
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            pingProgressTask.Increment(1);
-                            pingSemaphore.Release();
-                        }
-                    });
-                    await Task.WhenAll(pingTasks);
+            using var cts = new CancellationTokenSource();
+            var cancellationToken = cts.Token;
 
-                    var resolveProgressTask = ctx.AddTask("[aqua]解析主机[/]", new ProgressTaskSettings { MaxValue = onlineHosts.Count });
-                    var arpCache = GetArpCache();
-                    var resolveSemaphore = new SemaphoreSlim(50);
-                    var resolveTasks = onlineHosts.Select(async host =>
+            var keyListenerTask = Task.Run(() =>
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape)
                     {
-                        await resolveSemaphore.WaitAsync();
-                        try
+                        cts.Cancel();
+                    }
+                    Task.Delay(50, cancellationToken).ContinueWith(_ => { });
+                }
+            }, cancellationToken);
+
+            try
+            {
+                await AnsiConsole.Progress()
+                    .Columns(new ProgressColumn[]
+                    {
+                        new TaskDescriptionColumn(),
+                        new ProgressBarColumn(),
+                        new PercentageColumn(),
+                        new SpinnerColumn(),
+                    })
+                    .StartAsync(async ctx =>
+                    {
+                        var pingProgressTask = ctx.AddTask("[green]Ping 扫描[/]", new ProgressTaskSettings { MaxValue = ipRange.Count });
+                        var pingSemaphore = new SemaphoreSlim(100);
+                        var pingTasks = ipRange.Select(async ip =>
                         {
-                            string ipStr = host.ToString();
-                            string macAddress = arpCache.TryGetValue(ipStr, out var mac) ? mac : "(无法获取)";
-                            string hostname = "(无法解析)";
+                            if (cancellationToken.IsCancellationRequested) return;
+                            await pingSemaphore.WaitAsync(cancellationToken);
                             try
                             {
-                                var resolveHostTask = Dns.GetHostEntryAsync(host);
-                                if (await Task.WhenAny(resolveHostTask, Task.Delay(1500)) == resolveHostTask && !resolveHostTask.IsFaulted)
+                                if (cancellationToken.IsCancellationRequested) return;
+                                using (var ping = new Ping())
                                 {
-                                    hostname = resolveHostTask.Result.HostName;
+                                    var reply = await ping.SendPingAsync(ip, 1000);
+                                    if (reply.Status == IPStatus.Success)
+                                    {
+                                        onlineHosts.Add(ip);
+                                    }
                                 }
                             }
-                            catch (SocketException) { }
+                            finally
+                            {
+                                pingProgressTask.Increment(1);
+                                pingSemaphore.Release();
+                            }
+                        });
+                        await Task.WhenAll(pingTasks);
 
-                            results.Add(new ScanResult { IpAddress = ipStr, MacAddress = macAddress, Hostname = hostname });
-                        }
-                        finally
+                        if (cancellationToken.IsCancellationRequested)
                         {
-                            resolveProgressTask.Increment(1);
-                            resolveSemaphore.Release();
+                            wasCancelled = true;
+                            return;
                         }
+
+                        var resolveProgressTask = ctx.AddTask("[aqua]解析主机[/]", new ProgressTaskSettings { MaxValue = onlineHosts.Count });
+                        var arpCache = GetArpCache();
+                        var resolveSemaphore = new SemaphoreSlim(50);
+                        var resolveTasks = onlineHosts.Select(async host =>
+                        {
+                            if (cancellationToken.IsCancellationRequested) return;
+                            await resolveSemaphore.WaitAsync(cancellationToken);
+                            try
+                            {
+                                if (cancellationToken.IsCancellationRequested) return;
+                                string ipStr = host.ToString();
+                                string macAddress = arpCache.TryGetValue(ipStr, out var mac) ? mac : "(无法获取)";
+                                string hostname = "(无法解析)";
+                                try
+                                {
+                                    var resolveHostTask = Dns.GetHostEntryAsync(host);
+                                    if (await Task.WhenAny(resolveHostTask, Task.Delay(1500, cancellationToken)) == resolveHostTask && !resolveHostTask.IsFaulted)
+                                    {
+                                        hostname = resolveHostTask.Result.HostName;
+                                    }
+                                }
+                                catch (SocketException) { }
+                                catch (TaskCanceledException) { }
+
+                                results.Add(new ScanResult { IpAddress = ipStr, MacAddress = macAddress, Hostname = hostname });
+                            }
+                            finally
+                            {
+                                resolveProgressTask.Increment(1);
+                                resolveSemaphore.Release();
+                            }
+                        });
+                        await Task.WhenAll(resolveTasks);
                     });
-                    await Task.WhenAll(resolveTasks);
-                });
+            }
+            catch (TaskCanceledException)
+            {
+                wasCancelled = true;
+            }
+            finally
+            {
+                if (!cts.IsCancellationRequested)
+                {
+                    cts.Cancel();
+                }
+                await keyListenerTask;
+                while (Console.KeyAvailable)
+                {
+                    Console.ReadKey(true);
+                }
+            }
 
 
             string localIp = ipAddress.ToString();
@@ -386,10 +434,14 @@ namespace IPSwitcher
             }
             else
             {
-                finalResults.Add(new ScanResult { IpAddress = localIp, MacAddress = localMac, Hostname = localHostname });
+                if (!wasCancelled)
+                {
+                    finalResults.Add(new ScanResult { IpAddress = localIp, MacAddress = localMac, Hostname = localHostname });
+                }
             }
 
-            PrintResultsTable(finalResults, localIp);
+            var tableCaption = wasCancelled ? "[bold yellow]扫描已被用户中断[/]" : "[bold blue]局域网扫描结果[/]";
+            PrintResultsTable(finalResults, localIp, tableCaption);
         }
 
         /// <summary>
@@ -1323,10 +1375,10 @@ namespace IPSwitcher
         /// <summary>
         /// 打印包含主机名的对齐扫描结果表格。
         /// </summary>
-        private static void PrintResultsTable(List<ScanResult> results, string localIp)
+        private static void PrintResultsTable(List<ScanResult> results, string localIp, string tableTitle = "[bold blue]局域网扫描结果[/]")
         {
             var table = new Table().Expand().Border(TableBorder.Rounded);
-            table.Title = new TableTitle("[bold blue]局域网扫描结果[/]");
+            table.Title = new TableTitle(tableTitle);
             table.AddColumn("[bold]IP 地址[/]");
             table.AddColumn("[bold]MAC 地址[/]");
             table.AddColumn("[bold]主机名[/]");
