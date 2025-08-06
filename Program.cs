@@ -1,24 +1,157 @@
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
-using System.Linq;
 using System.Net;
-using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
 namespace IPSwitcher
 {
+    #region New Classes for Added Features
+
+    /// <summary>
+    /// 管理应用程序设置，从JSON文件加载和保存。
+    /// </summary>
+    public static class SettingsManager
+    {
+        private static readonly string FilePath;
+        public static AppSettings Current { get; private set; }
+
+        static SettingsManager()
+        {
+            // 在 %APPDATA% 中构建路径
+            string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            string settingsDir = Path.Combine(appDataPath, "ipTools");
+            FilePath = Path.Combine(settingsDir, "settings.json");
+            Current = new AppSettings();
+        }
+
+        public static void Load()
+        {
+            try
+            {
+                if (File.Exists(FilePath))
+                {
+                    string json = File.ReadAllText(FilePath);
+                    Current = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                }
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[yellow]警告: 无法加载配置文件。将使用默认设置。 ({Markup.Escape(ex.Message)})[/]");
+                Current = new AppSettings();
+            }
+        }
+
+        public static void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string json = JsonSerializer.Serialize(Current, options);
+                File.WriteAllText(FilePath, json);
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]错误: 无法保存配置文件。 ({Markup.Escape(ex.Message)})[/]");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 定义应用程序的可配置设置。
+    /// </summary>
+    public class AppSettings
+    {
+        public int PingConcurrency { get; set; } = 100;
+        public int ResolveConcurrency { get; set; } = 50;
+    }
+
+    /// <summary>
+    /// 跟踪网络接口的流量统计信息。
+    /// </summary>
+    public static class NetworkTrafficMonitor
+    {
+        private static Timer? _timer;
+        private static long _lastTotalSent = 0;
+        private static long _lastTotalReceived = 0;
+
+        public static string CurrentUpSpeed { get; private set; } = "0 B/s".PadLeft(12);
+        public static string CurrentDownSpeed { get; private set; } = "0 B/s".PadLeft(12);
+        public static string TotalDataTransferred { get; private set; } = "0 B";
+
+        public static void Initialize()
+        {
+            if (!NetworkInterface.GetIsNetworkAvailable()) return;
+
+            _lastTotalSent = GetTotalBytesSent();
+            _lastTotalReceived = GetTotalBytesReceived();
+
+            _timer = new Timer(UpdateGlobalStats, null, 1000, 1000);
+        }
+
+        private static void UpdateGlobalStats(object? state)
+        {
+            long currentTotalSent = GetTotalBytesSent();
+            long currentTotalReceived = GetTotalBytesReceived();
+
+            long sentSinceLast = currentTotalSent - _lastTotalSent;
+            long receivedSinceLast = currentTotalReceived - _lastTotalReceived;
+
+            CurrentUpSpeed = $"{FormatBytes(sentSinceLast)}/s".PadLeft(12);
+            CurrentDownSpeed = $"{FormatBytes(receivedSinceLast)}/s".PadLeft(12);
+            TotalDataTransferred = FormatBytes(currentTotalSent + currentTotalReceived);
+
+            _lastTotalSent = currentTotalSent;
+            _lastTotalReceived = currentTotalReceived;
+        }
+
+        public static long GetTotalBytesSent()
+        {
+            if (!NetworkInterface.GetIsNetworkAvailable()) return 0;
+            return NetworkInterface.GetAllNetworkInterfaces().Sum(ni =>
+            {
+                try { return ni.GetIPv4Statistics().BytesSent; }
+                catch { return 0L; }
+            });
+        }
+
+        public static long GetTotalBytesReceived()
+        {
+            if (!NetworkInterface.GetIsNetworkAvailable()) return 0;
+            return NetworkInterface.GetAllNetworkInterfaces().Sum(ni =>
+            {
+                try { return ni.GetIPv4Statistics().BytesReceived; }
+                catch { return 0L; }
+            });
+        }
+
+        /// <summary>
+        /// 将字节计数格式化为人类可读的字符串（B, KB, MB, GB 等）。
+        /// </summary>
+        public static string FormatBytes(long bytes)
+        {
+            string[] suffixes = { "B", "KB", "MB", "GB", "TB", "PB" };
+            int i = 0;
+            double dblSByte = bytes;
+            while (dblSByte >= 1024 && i < suffixes.Length - 1)
+            {
+                dblSByte /= 1024;
+                i++;
+            }
+            return $"{dblSByte:0.##} {suffixes[i]}";
+        }
+    }
+
+    #endregion
+
     /// <summary>
     /// 用于存储局域网扫描结果的辅助类。
     /// </summary>
@@ -64,6 +197,12 @@ namespace IPSwitcher
             // 设置控制台编码为UTF-8以正确显示中文
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
+
+            // 从文件加载设置
+            SettingsManager.Load();
+
+            // 初始化网络流量监视器
+            NetworkTrafficMonitor.Initialize();
 
             // 异步获取公网IP信息，不阻塞UI
             _ = GetPublicIpInfoAsync();
@@ -120,6 +259,8 @@ namespace IPSwitcher
                 "配置网络适配器 IP",
                 "扫描局域网设备",
                 "网络诊断工具",
+                "流量监控",
+                "设置",
                 "退出程序"
             };
 
@@ -142,6 +283,12 @@ namespace IPSwitcher
                     await NetworkDiagnosticsMenu();
                     break;
                 case 3:
+                    await ShowTrafficMonitor();
+                    break;
+                case 4:
+                    await ShowSettingsMenu();
+                    break;
+                case 5:
                 case -1: // ESC in main menu means exit
                     return false; // 发出退出主循环的信号
             }
@@ -176,6 +323,10 @@ namespace IPSwitcher
                 grid.AddRow("[bold]活动连接:[/]", "[red]无活动连接[/]");
                 grid.AddRow("[bold]本地 IP:[/]", "[red]N/A[/]");
             }
+
+            // 新增流量统计信息
+            grid.AddRow("[bold]实时速率:[/]", $"[red]↑{NetworkTrafficMonitor.CurrentUpSpeed}[/]  [green]↓{NetworkTrafficMonitor.CurrentDownSpeed}[/]");
+            grid.AddRow("[bold]已用流量:[/]", $"[cyan](开机) {NetworkTrafficMonitor.TotalDataTransferred}[/]");
 
             return grid;
         }
@@ -354,7 +505,7 @@ namespace IPSwitcher
                     .StartAsync(async ctx =>
                     {
                         var pingProgressTask = ctx.AddTask("[green]Ping 扫描[/]", new ProgressTaskSettings { MaxValue = ipRange.Count });
-                        var pingSemaphore = new SemaphoreSlim(100);
+                        var pingSemaphore = new SemaphoreSlim(SettingsManager.Current.PingConcurrency);
                         var pingTasks = ipRange.Select(async ip =>
                         {
                             if (cancellationToken.IsCancellationRequested) return;
@@ -387,7 +538,7 @@ namespace IPSwitcher
 
                         var resolveProgressTask = ctx.AddTask("[aqua]解析主机[/]", new ProgressTaskSettings { MaxValue = onlineHosts.Count });
                         var arpCache = GetArpCache();
-                        var resolveSemaphore = new SemaphoreSlim(50);
+                        var resolveSemaphore = new SemaphoreSlim(SettingsManager.Current.ResolveConcurrency);
                         var resolveTasks = onlineHosts.Select(async host =>
                         {
                             if (cancellationToken.IsCancellationRequested) return;
@@ -621,6 +772,182 @@ namespace IPSwitcher
             }
             AnsiConsole.Write(table);
         }
+
+        #region 新增功能方法
+
+        /// <summary>
+        /// 显示流量监控页面。
+        /// </summary>
+        static async Task ShowTrafficMonitor()
+        {
+            AnsiConsole.Clear();
+
+            var sessionStartStats = new ConcurrentDictionary<string, (long Sent, long Received)>();
+            var lastCycleStats = new ConcurrentDictionary<string, (long Sent, long Received, DateTime Time)>();
+            bool isFirstRun = true;
+
+            using var cts = new CancellationTokenSource();
+            var token = cts.Token;
+
+            // 监听 Esc 键以退出
+            var keyListenerTask = Task.Run(() =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape)
+                    {
+                        cts.Cancel();
+                    }
+                    Task.Delay(50, token).ContinueWith(_ => { });
+                }
+            }, token);
+
+            try
+            {
+                await AnsiConsole.Live(new Table())
+                .StartAsync(async ctx =>
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        var interfaces = NetworkInterface.GetAllNetworkInterfaces()
+                            .Where(ni => ni.OperationalStatus == OperationalStatus.Up && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback && ni.Supports(NetworkInterfaceComponent.IPv4))
+                            .ToList();
+
+                        var table = new Table().Expand().Border(TableBorder.Rounded);
+                        table.Title = new TableTitle($"[bold blue]实时流量监控[/] [grey](每秒刷新, 按 Esc 退出)[/]");
+                        table.AddColumn(new TableColumn("[bold]适配器[/]").Centered());
+                        table.AddColumn(new TableColumn("[bold]实时速率 (↑/↓)[/]").Centered());
+                        table.AddColumn(new TableColumn("[bold]已上传 (开机)[/]").Centered());
+                        table.AddColumn(new TableColumn("[bold]已下载 (开机)[/]").Centered());
+                        table.AddColumn(new TableColumn("[bold]已上传 (会话)[/]").Centered());
+                        table.AddColumn(new TableColumn("[bold]已下载 (会话)[/]").Centered());
+
+
+                        foreach (var ni in interfaces)
+                        {
+                            IPv4InterfaceStatistics stats;
+                            try
+                            {
+                                stats = ni.GetIPv4Statistics();
+                            }
+                            catch { continue; }
+
+                            long currentSent = stats.BytesSent;
+                            long currentReceived = stats.BytesReceived;
+                            var currentTime = DateTime.UtcNow;
+
+                            // 初始化会话和速率计算的基准值
+                            if (isFirstRun)
+                            {
+                                sessionStartStats[ni.Id] = (currentSent, currentReceived);
+                                lastCycleStats[ni.Id] = (currentSent, currentReceived, currentTime);
+                            }
+
+                            sessionStartStats.TryAdd(ni.Id, (currentSent, currentReceived));
+                            lastCycleStats.TryAdd(ni.Id, (currentSent, currentReceived, currentTime));
+
+
+                            // 计算速率
+                            var lastStats = lastCycleStats[ni.Id];
+                            var timeDiff = (currentTime - lastStats.Time).TotalSeconds;
+                            string upSpeed = "0 B/s";
+                            string downSpeed = "0 B/s";
+
+                            if (timeDiff > 0)
+                            {
+                                upSpeed = $"{NetworkTrafficMonitor.FormatBytes((long)((currentSent - lastStats.Sent) / timeDiff))}/s";
+                                downSpeed = $"{NetworkTrafficMonitor.FormatBytes((long)((currentReceived - lastStats.Received) / timeDiff))}/s";
+                            }
+
+                            string formattedRate = $"[red]↑ {upSpeed.PadLeft(10)}[/]  [green]↓ {downSpeed.PadLeft(10)}[/]";
+
+                            // 更新上一周期的数据
+                            lastCycleStats[ni.Id] = (currentSent, currentReceived, currentTime);
+
+                            // 计算会话流量
+                            var sessionStats = sessionStartStats[ni.Id];
+                            long sessionSentBytes = currentSent - sessionStats.Sent;
+                            long sessionReceivedBytes = currentReceived - sessionStats.Received;
+                            string sessionSent = NetworkTrafficMonitor.FormatBytes(sessionSentBytes);
+                            string sessionReceived = NetworkTrafficMonitor.FormatBytes(sessionReceivedBytes);
+
+                            // 开机总流量
+                            string bootSent = NetworkTrafficMonitor.FormatBytes(currentSent);
+                            string bootReceived = NetworkTrafficMonitor.FormatBytes(currentReceived);
+
+                            table.AddRow(
+                                new Markup($"[yellow]{Markup.Escape(ni.Name)}[/]"),
+                                new Markup(formattedRate),
+                                new Markup($"[cyan]{bootSent.PadLeft(10)}[/]"),
+                                new Markup($"[cyan]{bootReceived.PadLeft(10)}[/]"),
+                                new Markup($"[magenta]{sessionSent.PadLeft(10)}[/]"),
+                                new Markup($"[magenta]{sessionReceived.PadLeft(10)}[/]")
+                            );
+                        }
+
+                        ctx.UpdateTarget(table);
+                        ctx.Refresh();
+                        isFirstRun = false;
+                        await Task.Delay(1000, token);
+                    }
+                });
+            }
+            catch (TaskCanceledException) { /* 正常退出 */ }
+            finally
+            {
+                if (!cts.IsCancellationRequested) cts.Cancel();
+                await keyListenerTask;
+            }
+        }
+
+        /// <summary>
+        /// 显示设置菜单。
+        /// </summary>
+        static async Task ShowSettingsMenu()
+        {
+            while (true)
+            {
+                AnsiConsole.Clear();
+                var options = new List<string>
+                {
+                    $"修改 Ping 并发数 (当前: {SettingsManager.Current.PingConcurrency})",
+                    $"修改主机解析并发数 (当前: {SettingsManager.Current.ResolveConcurrency})",
+                    "返回主菜单"
+                };
+
+                var choiceIndex = await ShowMenuAsync(options, "[bold]设置[/]");
+
+                if (choiceIndex == -1 || choiceIndex == 2)
+                {
+                    SettingsManager.Save(); // 在退出时保存
+                    return;
+                }
+
+                switch (choiceIndex)
+                {
+                    case 0:
+                        var newPing = AnsiConsole.Prompt(
+                            new TextPrompt<int>($"输入新的 [green]Ping 并发数[/] (推荐 50-200):")
+                                .DefaultValue(SettingsManager.Current.PingConcurrency)
+                                .ValidationErrorMessage("[red]请输入一个有效的正整数[/]")
+                                .Validate(p => p > 0)
+                        );
+                        SettingsManager.Current.PingConcurrency = newPing;
+                        break;
+                    case 1:
+                        var newResolve = AnsiConsole.Prompt(
+                            new TextPrompt<int>($"输入新的 [green]主机解析并发数[/] (推荐 25-100):")
+                                .DefaultValue(SettingsManager.Current.ResolveConcurrency)
+                                .ValidationErrorMessage("[red]请输入一个有效的正整数[/]")
+                                .Validate(r => r > 0)
+                        );
+                        SettingsManager.Current.ResolveConcurrency = newResolve;
+                        break;
+                }
+            }
+        }
+
+        #endregion
 
         #region 网络诊断工具
 
