@@ -150,7 +150,7 @@ namespace IPSwitcher
         }
 
         /// <summary>
-        /// [已修复] 使用传入的适配器信息构建本地信息网格，避免重复的系统调用。
+        /// [已修改] 使用传入的适配器信息构建本地信息网格，以展示更丰富的信息。
         /// </summary>
         private static Grid GetLocalInfoGrid(AdapterInfo? activeAdapter)
         {
@@ -158,8 +158,25 @@ namespace IPSwitcher
             grid.AddColumn(new GridColumn().Width(12).NoWrap()); // 固定宽度的标签列
             grid.AddColumn(new GridColumn());
             grid.AddRow("[bold]当前时间:[/]", $"[yellow]{DateTime.Now:yyyy-MM-dd HH:mm:ss}[/]");
-            grid.AddRow("[bold]活动连接:[/]", $"[yellow]{Markup.Escape(activeAdapter?.Name ?? "无活动连接")}[/]");
-            grid.AddRow("[bold]本地 IP:[/]", $"[yellow]{activeAdapter?.IpAddress ?? "N/A"}[/]");
+
+            if (activeAdapter != null)
+            {
+                grid.AddRow("[bold]活动连接:[/]", $"[yellow]{Markup.Escape(activeAdapter.Name)}[/]");
+                grid.AddRow("[bold]网卡描述:[/]", $"[yellow]{Markup.Escape(activeAdapter.Description)}[/]");
+                grid.AddRow("[bold]本地 IP:[/]", $"[yellow]{activeAdapter.IpAddress}[/]");
+
+                string ipType = activeAdapter.IsDhcpEnabled ? "[green]动态 (DHCP)[/]" : "[cyan]静态[/]";
+                grid.AddRow("[bold]IP 分配:[/]", ipType);
+
+                string connectionType = activeAdapter.IsVirtual ? $"[grey]虚拟 ({activeAdapter.AdapterType})[/]" : $"[aqua]物理 ({activeAdapter.AdapterType})[/]";
+                grid.AddRow("[bold]连接类型:[/]", connectionType);
+            }
+            else
+            {
+                grid.AddRow("[bold]活动连接:[/]", "[red]无活动连接[/]");
+                grid.AddRow("[bold]本地 IP:[/]", "[red]N/A[/]");
+            }
+
             return grid;
         }
 
@@ -207,7 +224,7 @@ namespace IPSwitcher
             if (!string.IsNullOrEmpty(adapterToScan))
             {
                 await ScanLanDevices(adapterToScan);
-                AnsiConsole.Prompt(new TextPrompt<string>("[grey]扫描完成。按任意键返回主菜单...[/]").AllowEmpty());
+                AnsiConsole.Prompt(new TextPrompt<string>("[grey]操作完成。按任意键返回主菜单...[/]").AllowEmpty());
             }
         }
 
@@ -1543,17 +1560,41 @@ namespace IPSwitcher
     public class AdapterInfo
     {
         public string Name { get; }
-        public string Description { get; } // 新增：用于存储网卡的详细描述
+        public string Description { get; }
         public bool IsActive { get; }
         public bool IsVirtual { get; }
         public string Display { get; private set; }
         public string IpAddress { get; }
+        public bool IsDhcpEnabled { get; }
+        public string AdapterType { get; }
 
         public AdapterInfo(NetworkInterface ni, int activeInterfaceIndex)
         {
             Name = ni.Name;
-            Description = ni.Description; // 新增：将网卡描述赋值给新属性
-            IsActive = ni.GetIPProperties().GetIPv4Properties()?.Index == activeInterfaceIndex;
+            Description = ni.Description;
+            AdapterType = ni.NetworkInterfaceType.ToString();
+
+            // 添加平台检查来安全地访问特定于Windows的属性
+            if (OperatingSystem.IsWindows())
+            {
+                var ipv4Props = ni.GetIPProperties().GetIPv4Properties();
+                if (ipv4Props != null)
+                {
+                    IsActive = ipv4Props.Index == activeInterfaceIndex;
+                    IsDhcpEnabled = ipv4Props.IsDhcpEnabled;
+                }
+                else
+                {
+                    IsActive = false;
+                    IsDhcpEnabled = false;
+                }
+            }
+            else // 对于非Windows平台，提供默认值
+            {
+                IsActive = ni.OperationalStatus == OperationalStatus.Up;
+                IsDhcpEnabled = false; // 非Windows平台下，我们无法轻易判断，先默认为false
+            }
+
 
             string desc = ni.Description.ToLower();
             IsVirtual = desc.Contains("virtual") || desc.Contains("vpn") || desc.Contains("tap") || desc.Contains("tun") || desc.Contains("clash");
