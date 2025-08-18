@@ -1652,8 +1652,13 @@ namespace IPSwitcher
                     p.StartInfo.RedirectStandardOutput = true;
                     p.StartInfo.RedirectStandardError = true;
                     p.StartInfo.CreateNoWindow = true;
-                    p.StartInfo.StandardOutputEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
-                    p.StartInfo.StandardErrorEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+
+                    // =================================================================
+                    // BUG修复: 移除以下两行强制指定OEM编码的代码。
+                    // 这允许.NET运行时和控制台环境更好地自动处理编码，从而解决乱码问题。
+                    // p.StartInfo.StandardOutputEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+                    // p.StartInfo.StandardErrorEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+                    // =================================================================
 
                     p.Start();
                     string output = p.StandardOutput.ReadToEnd();
