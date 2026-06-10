@@ -1,3 +1,11 @@
+> ## ⚠️ 本项目已停止维护
+>
+> 本项目（ipTools C# 版）已不再更新。请使用全新重写的 **[iptools](https://github.com/newcovid/iptools)** —— 基于 Rust 构建，性能更好、TUI 更美观、功能更全面，支持 Dashboard / 适配器管理 / 局域网扫描 / 实时流量 / 多种诊断工具 / 多语言 等。
+>
+> **👉 前往新项目：[https://github.com/newcovid/iptools](https://github.com/newcovid/iptools)**
+
+---
+
 # ipTools - 一个 C# 网络命令行工具集
 
 ipTools 是一个使用 C# 编写的、功能丰富的网络命令行小工具，旨在为用户提供一个现代化且易于使用的界面来执行常见的网络配置和诊断任务。此工具利用 Spectre.Console 库构建美观的交互式界面，并集成了多种网络实用功能。
